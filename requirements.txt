@@ -1,0 +1,14 @@
+ttkbootstrap
+tkinterdnd2
+sounddevice
+numpy
+selenium
+webdriver-manager
+pandas
+undetected-chromedriver
+pystray
+Pillow
+pynput
+requests
+matplotlib
+seaborn
