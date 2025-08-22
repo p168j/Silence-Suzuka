@@ -2720,7 +2720,7 @@ class AudioMonitorApp:
         self.log("Expanding all playlists into a random pool...", "blue")
         try:
             options = uc.ChromeOptions(); options.add_argument("--headless=new"); options.add_argument("--mute-audio")
-            with uc.Chrome(options=options, version_main=139, patcher_force_close=True) as temp_browser:
+            with uc.Chrome(options=options, patcher_force_close=True) as temp_browser:
                 self.expanded_video_pool = self.preprocess_playlists(urls_to_monitor, temp_browser)
         except Exception as e:
             self.log(f"Failed to expand playlists for random mode: {e}", "red")
@@ -2766,7 +2766,7 @@ class AudioMonitorApp:
             # ✅ FIX: Force patcher to close old processes and ensure compatibility.
             # Manually set your Chrome version number here (e.g., 139)
             self.log("Patching and creating uc.Chrome instance...");
-            self.browser = uc.Chrome(options=options, version_main=139, patcher_force_close=True)
+            self.browser = uc.Chrome(options=options, patcher_force_close=True)
             self.log("Browser instance created successfully.", "green")
             
             if not self.headless_var.get():
@@ -3818,7 +3818,7 @@ class AudioMonitorApp:
             try:
                 options = uc.ChromeOptions()
                 options.add_argument("--headless=new")
-                with uc.Chrome(options=options, version_main=139, patcher_force_close=True) as temp_browser:
+                with uc.Chrome(options=options, patcher_force_close=True) as temp_browser:
                     for sub in web_subscriptions:
                         self.log(f"Checking Channel: {sub['source']}", "cyan")
                         try:
