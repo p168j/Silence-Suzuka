@@ -2,11 +2,6 @@
 """
 Audio Monitor Application - Modern UI with ttkbootstrap
 ============================================================================
-MODIFIED VERSION: This script has been altered from its original purpose.
-It no longer listens for external sound to PAUSE video.
-Instead, it now listens for internal computer audio to detect SILENCE,
-and will automatically PLAY/ADVANCE the video after a set duration of silence.
-============================================================================
 SETUP INSTRUCTIONS:
 ============================================================================
 This application requires several external libraries to be installed.
@@ -4052,7 +4047,8 @@ class AudioMonitorApp:
             self.preview_window.destroy()
 
         values = self.url_tree.item(item_id, 'values')
-        url = values[1]
+        # CORRECTED: Get URL from index [2] instead of [1]
+        url = values[2]
 
         if not url.startswith("http"):
             return
