@@ -184,6 +184,7 @@ class AudioMonitorApp:
         self.log_visible = tk.BooleanVar(value=False)
         self.now_playing_progress_var = tk.DoubleVar(value=0)
         self.now_playing_title_var = tk.StringVar(value="Nothing Playing")
+        self.search_var.trace("w", self.filter_treeview)
         
         # --- Initialize State Variables ---
         self.ignore_timestamps_for_session = False
@@ -220,12 +221,11 @@ class AudioMonitorApp:
         self.preview_job = None
         self.now_playing_thumbnail_photo = None # To prevent garbage collection
         self.setup_complete_event = threading.Event() # FIX: For robust startup
-        self.settings_window = None # ✅ FEATURE: For advanced settings window
         self.skip_event = threading.Event()
         self.skip_to_next_in_playlist = False
         self.playlist_exhausted = False
         self.custom_settings_frame = None # To hold the custom settings frame widget
-
+        self.keybind_window = None # To ensure only one help window opens
         # --- ENHANCED: Audio visualization variables ---
         self.visualization_mode_var = tk.StringVar(value="bar")
         self.audio_buffer = deque(maxlen=4410)  # 0.1 second buffer at 44100 Hz
@@ -236,6 +236,7 @@ class AudioMonitorApp:
         self.waveform_line = None
         self.spectrum_bars = None
         self.visualization_animation = None
+        self.previous_playlist_mode = "Custom" # To store the mode before a change
         
         # --- FIX: Debounce variables for flicker-free silence indicator ---
         self.silence_debounce_time = 0.2 # 200ms
@@ -248,7 +249,7 @@ class AudioMonitorApp:
         self.populate_audio_devices()
         self.load_stats()
         
-        # ✅ FEATURE: Welcome dialog for first-time users
+        # Welcome dialog for first-time users
         if not os.path.exists(CONFIG_FILE):
             self.show_first_time_welcome()
         
@@ -261,12 +262,32 @@ class AudioMonitorApp:
         self.update_window_title() # Initial title set
         
         # --- Keyboard Shortcuts ---
-        # --- FIX: Spacebar now toggles play/pause/resume ---
+        self.root.bind('<F1>', self.show_keybinds)
         self.root.bind('<space>', self.toggle_play_pause)
         self.root.bind('<Escape>', lambda e: self.stop_monitoring())
         self.root.bind('<Delete>', lambda e: self.remove_selected_url())
+        
+        # Navigation
+        self.root.bind('<Right>', lambda e: self.next_video())
+        self.root.bind('<Left>', lambda e: self.previous_video())
+        self.root.bind('<Control-Right>', lambda e: self.skip_videos(5))
+        self.root.bind('<Control-Left>', lambda e: self.skip_videos(-5))
+
+        # Playlist Management
         self.root.bind('<Control-a>', lambda e: self.add_url_to_treeview())
         self.root.bind('<Control-A>', lambda e: self.add_url_to_treeview()) # For caps lock
+        self.root.bind('<Control-s>', lambda e: self.save_playlist())
+        self.root.bind('<Control-S>', lambda e: self.save_playlist())
+        self.root.bind('<Control-o>', lambda e: self.load_playlist())
+        self.root.bind('<Control-O>', lambda e: self.load_playlist())
+
+        # UI Interaction
+        self.root.bind('<Control-f>', lambda e: self.search_entry.focus_set())
+        self.root.bind('<Control-F>', lambda e: self.search_entry.focus_set())
+        self.root.bind('<Control-n>', lambda e: self.video_link_entry.focus_set())
+        self.root.bind('<Control-N>', lambda e: self.video_link_entry.focus_set())
+        self.root.bind('l', lambda e: self.toggle_log())
+        self.root.bind('L', lambda e: self.toggle_log())
         
         if self.app_geometry_var.get():
             try:
@@ -283,7 +304,7 @@ class AudioMonitorApp:
         self.start_afk_detector()
         self.update_flicker_free_indicator() # Start the flicker-free loop
         
-        # --- MODIFICATION: Set initial state of checkboxes on startup ---
+        # Set initial state of checkboxes on startup
         self.on_playlist_mode_change()
 
         print("Application initialized successfully!")
@@ -302,14 +323,12 @@ class AudioMonitorApp:
         
         # Clean up the title if we have one
         if title and title not in ["Fetching Title...", "Title Unavailable", "Title Fetch Failed"]:
-            # --- START MODIFICATION ---
             # Expanded list of suffixes to remove for cleaner titles
             suffixes_to_remove = [
                 '哔哩哔哩视频', ' - 哔哩哔哩', '-哔哩哔哩', '_bilibili', '| bilibili', '哔哩哔哩',
                 ' - YouTube', '| YouTube'
             ]
             for site_name in suffixes_to_remove:
-            # --- END MODIFICATION ---
                 if title.lower().endswith(site_name.lower()):
                     title = title[:-len(site_name)]
                     break
@@ -365,9 +384,7 @@ class AudioMonitorApp:
     def update_window_title(self):
         """Dynamically updates the main window's title bar with actual video title."""
         if self.is_monitoring:
-            # ENHANCED: Use actual title instead of URL
             display_name = self.get_video_title(self.current_url)
-            # Truncate if too long
             title = f"▶️ Playing - {display_name[:40]}"
             if len(display_name) > 40:
                 title += "..."
@@ -378,7 +395,8 @@ class AudioMonitorApp:
 
     def set_default_geometry(self):
         """Sets the default size and position for the main window."""
-        width = 1200
+        # REFACTORED: Default to a more vertical-friendly aspect ratio
+        width = 800
         height = self.root.winfo_screenheight() - 90 
         x_pos = (self.root.winfo_screenwidth() // 2) - (width // 2)
         self.root.geometry(f"{width}x{height}+{x_pos}+20")
@@ -424,8 +442,6 @@ class AudioMonitorApp:
         A simple wrapper to call save_profile for autosaving.
         This is triggered by UI element commands, bindings, and variable traces.
         """
-        # This check prevents saving an empty/default profile during app initialization
-        # before the user's actual profile has been loaded.
         if self.active_profile_name.get():
             self.save_profile()
 
@@ -435,62 +451,116 @@ class AudioMonitorApp:
         self.root.style.theme_use(theme_name)
         self._apply_custom_font_styles() # Re-apply custom fonts
         self.update_visualization_theme()
-        # AUTOSAVE CHANGE: We now call the autosave function directly.
+        
+        # --- START: NEWLY ADDED CODE ---
+        # Adjust countdown label color for better theme contrast
+        if theme_name in ['darkly', 'superhero']:
+            # Use 'light' style for better visibility on dark backgrounds
+            self.countdown_label.config(bootstyle="light")
+        else:
+            # Use the default 'secondary' style for light themes
+            self.countdown_label.config(bootstyle="secondary")
+        # --- END: NEWLY ADDED CODE ---
+
         self._autosave_settings()
 
     def _apply_custom_font_styles(self):
         """Applies a consistent, language-aware font to key widgets after a theme change."""
-        # Use a standard, simple font like Arial to avoid rendering bugs
         font_name = "Arial"
-
-        # Configure the general style (for themes like litera, darkly)
         self.root.style.configure('Treeview', font=(font_name, 12))
         self.root.style.configure('Treeview.Heading', font=(font_name, 10, 'bold'))
-
-        # Configure the specific 'primary' style (for the superhero theme)
         self.root.style.configure('primary.Treeview', font=(font_name, 12))
         self.root.style.configure('primary.Treeview.Heading', font=(font_name, 10, 'bold'))
 
+    # ==================================================================================
+    # --- REFACTOR: Main create_widgets method for the "Control Tower" layout ---
+    # ==================================================================================
     def create_widgets(self):
-        """Create all the UI elements for the application."""
-        # --- NEW: Now Playing Card ---
-        self.now_playing_frame = ttk.Labelframe(self.root, text="Now Playing", padding=10)
-        # This frame will be packed/unpacked by start/stop monitoring
+        """Create all the UI elements for the application using a top-bottom layout."""
+        # --- Main Layout Frames ---
+        # Top frame for the "Dashboard" (always visible controls)
+        # It has a fixed height, so it doesn't expand.
+        dashboard_frame = ttk.Frame(self.root, padding=(10, 10, 10, 0))
+        dashboard_frame.pack(fill=tk.X, side=tk.TOP)
 
+        # Bottom frame for the "Library & Settings" (tabbed interface)
+        # It expands to fill the remaining space.
+        main_content_frame = ttk.Frame(self.root, padding=10)
+        main_content_frame.pack(fill=tk.BOTH, expand=True)
+
+        # --- 1. Build the Dashboard (Top Frame) ---
+        self.dashboard_frame = dashboard_frame # Store reference for Now Playing card
+        
+        # Now Playing Card will be packed into the dashboard when monitoring starts
+        self.now_playing_frame = ttk.Labelframe(self.dashboard_frame, text="Now Playing", padding=10)
+        self.now_playing_frame.pack(fill=tk.X, pady=(0, 5))
         now_playing_content = ttk.Frame(self.now_playing_frame)
         now_playing_content.pack(fill=tk.BOTH, expand=True)
-
         self.now_playing_thumbnail_label = ttk.Label(now_playing_content)
         self.now_playing_thumbnail_label.pack(side=tk.LEFT, padx=(0, 10))
         self.set_placeholder_thumbnail()
-
         info_frame = ttk.Frame(now_playing_content)
         info_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
         self.now_playing_title_label = ttk.Label(info_frame, textvariable=self.now_playing_title_var, font=(get_japanese_font(), 14, 'bold'))
         self.now_playing_title_label.pack(anchor='w', fill=tk.X)
-
         self.now_playing_progress = ttk.Progressbar(info_frame, variable=self.now_playing_progress_var, maximum=100)
         self.now_playing_progress.pack(fill=tk.X, pady=5)
-
         self.now_playing_play_pause_btn = ttk.Button(now_playing_content, text="⏸️", command=self.toggle_play_pause, bootstyle="secondary", width=3)
         self.now_playing_play_pause_btn.pack(side=tk.RIGHT, padx=(10, 0))
 
-        # ✅ FEATURE: Advanced Settings Window - Main window no longer needs a paned window.
-        self.left_frame = ttk.Frame(self.root)
-        self.left_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0,10))
+        # Main Play/Pause/Stop Buttons
+        self.root.style.configure('big.TButton', font=(get_japanese_font(), 12, 'bold'))
+        button_frame = ttk.Frame(self.dashboard_frame)
+        button_frame.pack(fill=tk.X, pady=5, ipady=5)
+        self.start_btn = ttk.Button(button_frame, text="▶️ PLAY", command=self.start_monitoring_with_resume, bootstyle="success", style='big.TButton')
+        self.start_btn.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=2)
+        ToolTip(self.start_btn, "Start playing from last session (Space)")
+        self.pause_btn = ttk.Button(button_frame, text="⏸️ PAUSE", command=self.pause_monitoring, state=tk.DISABLED, bootstyle="warning", style='big.TButton')
+        self.pause_btn.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=2)
+        ToolTip(self.pause_btn, "Pause playback (Space)")
+        self.stop_btn = ttk.Button(button_frame, text="⏹️ STOP", command=self.stop_monitoring, state=tk.DISABLED, bootstyle="danger", style='big.TButton')
+        self.stop_btn.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=2)
+        ToolTip(self.stop_btn, "Stop playback (Esc)")
 
-        # --- Left Frame Content (Main Controls) ---
-        # Store url_frame as an instance variable to update its text
-        self.url_frame = ttk.Labelframe(self.left_frame, text="Playlist 📝", padding="10")
-        self.url_frame.pack(fill=tk.BOTH, pady=5, expand=True)
+        # Status Display
+        status_frame = ttk.Labelframe(self.dashboard_frame, text="Status", padding="10")
+        status_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+        status_top = ttk.Frame(status_frame)
+        status_top.pack(fill=tk.X)
+        self.status_label = ttk.Label(status_top, text="Status: 🎧 Listening", font=(get_japanese_font(), 12, 'bold'))
+        self.status_label.pack(side=tk.LEFT)
+        self.countdown_label = ttk.Label(status_top, textvariable=self.countdown_var, font=(get_japanese_font(), 11, 'italic'), bootstyle="secondary")
+        self.countdown_label.pack(side=tk.LEFT, padx=10)
+        ToolTip(self.countdown_label, text="When silence is detected for the duration set in Settings, this timer will begin. The next video will automatically play when the countdown is complete.")
+        self.silence_indicator = ttk.Label(status_top, text="", font=(get_japanese_font(), 11))
+        self.silence_indicator.pack(side=tk.LEFT, padx=10)
+        self.time_label = ttk.Label(status_top, text="Time: 0h 0m 0s", font=(get_japanese_font(), 12))
+        self.time_label.pack(side=tk.RIGHT)
+        self.visualization_container = ttk.Frame(status_frame, height=60)
+        self.visualization_container.pack(fill=tk.X, pady=(5, 0))
+        self.visualization_container.pack_propagate(False)
+        self.sound_bar_canvas = None # Will be populated by switch_visualization
+        log_toggle_frame = ttk.Frame(status_frame)
+        log_toggle_frame.pack(fill=tk.X, pady=(5,0))
+        self.toggle_log_btn = ttk.Button(log_toggle_frame, text="Show Logs ▼", command=self.toggle_log, bootstyle="light-outline")
+        self.toggle_log_btn.pack(side=tk.LEFT)
+        self.log_text = scrolledtext.ScrolledText(status_frame, state='disabled', height=10, wrap=tk.WORD, font=(get_japanese_font(), 10))
+
+        # --- 2. Build the Main Content Area (Bottom Frame with Tabs) ---
+        notebook = ttk.Notebook(main_content_frame)
+        notebook.pack(fill=tk.BOTH, expand=True)
+
+        # -- Tab 1: Playlist --
+        playlist_tab = ttk.Frame(notebook, padding=(0, 10, 0, 0))
+        notebook.add(playlist_tab, text="Playlist")
         
+        self.url_frame = ttk.Labelframe(playlist_tab, text="Playlist 📝", padding="10")
+        self.url_frame.pack(fill=tk.BOTH, pady=5, expand=True)
         search_frame = ttk.Frame(self.url_frame)
         search_frame.pack(fill=tk.X, pady=(0, 5))
-        search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
-        search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ToolTip(search_entry, "Filter playlist by title or URL")
-
+        self.search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
+        self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ToolTip(self.search_entry, "Filter playlist by title or URL")
         self.root.style.configure('Treeview', font=(get_japanese_font(), 12), rowheight=35)
         self.root.style.configure('Treeview.Heading', font=(get_japanese_font(), 10, 'bold'))
         columns = ("title", "url", "type")
@@ -506,6 +576,10 @@ class AudioMonitorApp:
         self.url_tree.bind("<Button-3>", self.show_context_menu)
         self.url_tree.bind("<Motion>", self.on_tree_motion)
         self.url_tree.bind("<Leave>", self.on_tree_leave)
+        self.url_tree.bind("<ButtonPress-1>", self.on_drag_start)
+        self.url_tree.bind("<B1-Motion>", self.on_drag_motion)
+        self.url_tree.bind("<ButtonRelease-1>", self.on_drag_release)
+        self._drag_data = {"item": None, "y": 0}
         
         # Context Menu
         self.context_menu = tk.Menu(self.root, tearoff=0)
@@ -514,35 +588,31 @@ class AudioMonitorApp:
         self.context_menu.add_separator()
         self.context_menu.add_command(label="✔️ Mark as Watched", command=self.mark_as_watched)
         self.context_menu.add_command(label="✖️ Mark as Unwatched", command=self.mark_as_unwatched)
-
-        input_frame = ttk.Frame(self.left_frame)
+        
+        # Playlist Input and Management Buttons
+        input_frame = ttk.Frame(playlist_tab)
         input_frame.pack(fill=tk.X, pady=(0, 5))
         self.video_link_entry = ttk.Entry(input_frame)
         self.video_link_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         ToolTip(self.video_link_entry, "Paste a video/playlist URL or local file path here")
-        # Add shortcut hint to button
         self.add_url_btn = ttk.Button(input_frame, text="Add (Ctrl+A)", command=self.add_url_to_treeview, bootstyle="success")
         self.add_url_btn.pack(side=tk.LEFT, padx=2)
         self.add_folder_btn = ttk.Button(input_frame, text="Add Folder", command=self.add_folder_to_treeview, bootstyle="info")
         self.add_folder_btn.pack(side=tk.LEFT, padx=2)
         self.browse_file_btn = ttk.Button(input_frame, text="Browse File", command=self.browse_file, bootstyle="info")
         self.browse_file_btn.pack(side=tk.LEFT, padx=2)
-
-        playlist_button_frame = ttk.Frame(self.left_frame)
+        
+        playlist_button_frame = ttk.Frame(playlist_tab)
         playlist_button_frame.pack(fill=tk.X, pady=5)
-        # Add shortcut hint to button
         self.remove_url_btn = ttk.Button(playlist_button_frame, text="Remove (Del)", command=self.remove_selected_url, bootstyle="danger")
         self.remove_url_btn.pack(side=tk.LEFT, padx=5)
         self.save_playlist_btn = ttk.Button(playlist_button_frame, text="Save List", command=self.save_playlist, bootstyle="primary-outline")
         self.save_playlist_btn.pack(side=tk.LEFT, padx=5)
         self.load_playlist_btn = ttk.Button(playlist_button_frame, text="Load List", command=self.load_playlist, bootstyle="info-outline")
         self.load_playlist_btn.pack(side=tk.LEFT, padx=5)
-        # --- NEW: Clear All Button ---
-        ttk.Button(playlist_button_frame, text="🗑️ Clear All",
-                   command=self.clear_all_urls,
-                   bootstyle="danger-outline").pack(side=tk.LEFT, padx=5)
+        ttk.Button(playlist_button_frame, text="🗑️ Clear All", command=self.clear_all_urls, bootstyle="danger-outline").pack(side=tk.LEFT, padx=5)
         
-        # --- START MODIFICATION: Add Playlist Mode Combobox to main GUI ---
+        # --- START: NEWLY ADDED WIDGETS ---
         main_playlist_mode_combo = ttk.Combobox(playlist_button_frame, textvariable=self.playlist_mode_var,
                                                 values=["Sequential", "Shuffle All", "True Random", "Smart Shuffle", "Custom"],
                                                 state="readonly",
@@ -552,121 +622,299 @@ class AudioMonitorApp:
         main_playlist_mode_combo.bind("<<ComboboxSelected>>", self.on_playlist_mode_change)
 
         ttk.Label(playlist_button_frame, text="Playlist Mode:").pack(side=tk.RIGHT)
-        # --- END MODIFICATION ---
-        
-        self.url_tree.bind("<ButtonPress-1>", self.on_drag_start)
-        self.url_tree.bind("<B1-Motion>", self.on_drag_motion)
-        self.url_tree.bind("<ButtonRelease-1>", self.on_drag_release)
-        self._drag_data = {"item": None, "y": 0}
+        # --- END: NEWLY ADDED WIDGETS ---
 
-        self.nav_frame = ttk.Labelframe(self.left_frame, text="Navigation", padding="10")
-        # Packed/unpacked dynamically by update_playlist_info
+        ttk.Button(playlist_button_frame, text="📊 View Statistics", command=self.view_stats, bootstyle="info-outline").pack(side=tk.RIGHT, padx=5)
 
-        basic_nav_frame = ttk.Frame(self.nav_frame)
-        basic_nav_frame.pack(fill=tk.X, pady=(0, 5))
-        self.prev_btn = ttk.Button(basic_nav_frame, text="◀ Previous", command=self.previous_video, state=tk.DISABLED, bootstyle="primary-outline")
-        self.prev_btn.pack(side=tk.LEFT, padx=5)
-        self.playlist_info_label = ttk.Label(basic_nav_frame, text="No playlist loaded", font=(get_japanese_font(), 10))
-        self.playlist_info_label.pack(side=tk.LEFT, expand=True, padx=10)
-        self.next_btn = ttk.Button(basic_nav_frame, text="Next ▶", command=self.next_video, state=tk.DISABLED, bootstyle="primary-outline")
-        self.next_btn.pack(side=tk.RIGHT, padx=5)
+        # Improved Navigation Panel - Replace lines 884-907 in your code
 
-        quick_jump_frame = ttk.Frame(self.nav_frame)
-        quick_jump_frame.pack(fill=tk.X, pady=(0, 5))
-        ttk.Button(quick_jump_frame, text="◀◀ -10", command=lambda: self.skip_videos(-10), bootstyle="secondary-outline", width=8).pack(side=tk.LEFT, padx=2)
-        ttk.Button(quick_jump_frame, text="◀ -5", command=lambda: self.skip_videos(-5), bootstyle="secondary-outline", width=6).pack(side=tk.LEFT, padx=2)
-        self.jump_entry = ttk.Entry(quick_jump_frame, textvariable=self.jump_entry_var, width=6)
-        self.jump_entry.pack(side=tk.LEFT, padx=(10,2), fill=tk.X, expand=True)
-        ToolTip(self.jump_entry, "Jump to video number")
+       # Navigation Controls (inside playlist tab) 
+        self.nav_frame = ttk.Labelframe(playlist_tab, text="Navigation", padding="5")
+
+        # Single line ultra-compact navigation
+        nav_line = ttk.Frame(self.nav_frame)
+        nav_line.pack(fill=tk.X)
+
+        # Left side - Previous controls
+        ttk.Button(nav_line, text="◀◀", command=lambda: self.skip_videos(-10), 
+                width=3, bootstyle="secondary-outline").pack(side=tk.LEFT, padx=1)
+        ttk.Button(nav_line, text="-5", command=lambda: self.skip_videos(-5), 
+                width=3, bootstyle="secondary-outline").pack(side=tk.LEFT, padx=1)
+        self.prev_btn = ttk.Button(nav_line, text="◀", command=self.previous_video, 
+                                state=tk.DISABLED, bootstyle="primary", width=3)
+        self.prev_btn.pack(side=tk.LEFT, padx=3)
+
+        # Center - Jump control (compact)
+        center_frame = ttk.Frame(nav_line)
+        center_frame.pack(side=tk.LEFT, expand=True)
+        jump_container = ttk.Frame(center_frame)
+        jump_container.pack(expand=True)
+
+        self.jump_entry = ttk.Entry(jump_container, textvariable=self.jump_entry_var, 
+                                    width=4, justify='center', font=(get_japanese_font(), 10))
+        self.jump_entry.pack(side=tk.LEFT)
         self.jump_entry.bind('<Return>', self.on_jump_entry)
         self.jump_entry.bind('<KP_Enter>', self.on_jump_entry)
-        ttk.Button(quick_jump_frame, text="▶ +5", command=lambda: self.skip_videos(5), bootstyle="secondary-outline", width=6).pack(side=tk.LEFT, padx=2)
-        ttk.Button(quick_jump_frame, text="▶▶ +10", command=lambda: self.skip_videos(10), bootstyle="secondary-outline", width=8).pack(side=tk.LEFT, padx=2)
-        
-        # ✅ FIX: Create the Toplevel settings window and its content at startup, but keep it hidden.
-        # This ensures all widget attributes exist when needed and are parented correctly, fixing the crash.
-        self.settings_window = ttk.Toplevel(self.root)
-        self.settings_window.title("Advanced Settings")
-        self.settings_window.transient(self.root)
-        self.settings_window.geometry("550x750")
-        self.settings_window.protocol("WM_DELETE_WINDOW", self.toggle_settings_window)
-        self._create_settings_panel(self.settings_window)
-        self.settings_window.withdraw() # Start hidden
 
-        # --- Bottom Controls ---
-        bottom_controls_frame = ttk.Frame(self.left_frame)
-        bottom_controls_frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(jump_container, text="/", font=(get_japanese_font(), 10)).pack(side=tk.LEFT, padx=2)
+        self.total_videos_label = ttk.Label(jump_container, text="--", font=(get_japanese_font(), 10, 'bold'))
+        self.total_videos_label.pack(side=tk.LEFT)
+
+        # Right side - Next controls
+        self.next_btn = ttk.Button(nav_line, text="▶", command=self.next_video, 
+                                state=tk.DISABLED, bootstyle="primary", width=3)
+        self.next_btn.pack(side=tk.RIGHT, padx=3)
+        ttk.Button(nav_line, text="+5", command=lambda: self.skip_videos(5), 
+                width=3, bootstyle="secondary-outline").pack(side=tk.RIGHT, padx=1)
+        ttk.Button(nav_line, text="▶▶", command=lambda: self.skip_videos(10), 
+                width=3, bootstyle="secondary-outline").pack(side=tk.RIGHT, padx=1)
+
+        # Info label below (smaller, more compact)
+        self.playlist_info_label = ttk.Label(self.nav_frame, text="No playlist loaded", 
+                                            font=(get_japanese_font(), 9), bootstyle="secondary")
+        self.playlist_info_label.pack(fill=tk.X, pady=(3, 0))
+
+
+        # -- Tab 2: Settings --
+        settings_tab = ttk.Frame(notebook, padding=10)
+        notebook.add(settings_tab, text="Settings")
         
-        # --- Quick Start Controls ---
-        quick_start_frame = ttk.Frame(bottom_controls_frame)
-        quick_start_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(quick_start_frame, text="Silence Duration (min):").pack(side=tk.LEFT, padx=(0, 5))
-        self.silence_entry = ttk.Entry(quick_start_frame, textvariable=self.silence_minutes_var, width=5)
+        # Call the refactored method to build the settings UI inside the tab
+        self._create_settings_tab(settings_tab)
+        
+        # --- 3. Final Initialization ---
+        self.root.after(100, self.initialize_visualization)
+
+    def show_keybinds(self, event=None):
+        """Displays a Toplevel window with a list of all available keybinds, ensuring only one instance exists."""
+        # --- START: MODIFICATION ---
+        # If the window already exists, just bring it to the front and return.
+        if self.keybind_window and self.keybind_window.winfo_exists():
+            self.keybind_window.lift()
+            return
+        # --- END: MODIFICATION ---
+
+        self.keybind_window = ttk.Toplevel(self.root)
+        self.keybind_window.title("Keyboard Shortcuts")
+        self.keybind_window.transient(self.root)
+        self.keybind_window.grab_set()
+        self.keybind_window.resizable(False, False)
+
+        main_frame = ttk.Frame(self.keybind_window, padding=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        header = ttk.Label(main_frame, text="Keyboard Shortcuts", font=(get_japanese_font(), 16, 'bold'))
+        header.pack(pady=(0, 15))
+
+        keybinds = {
+            "Playback Control": {
+                "Spacebar": "Play / Pause / Resume",
+                "Right Arrow": "Next Video in Playlist",
+                "Left Arrow": "Previous Video in Playlist",
+                "Ctrl + Right Arrow": "Jump Forward +5 Videos",
+                "Ctrl + Left Arrow": "Jump Back -5 Videos",
+                "Esc": "Stop Playback",
+            },
+            "Playlist Management": {
+                "Ctrl + A": "Add URL from Input Box",
+                "Delete": "Remove Selected Item(s)",
+                "Ctrl + S": "Save Current Playlist",
+                "Ctrl + O": "Load Playlist from File",
+            },
+            "UI Interaction": {
+                "F1": "Show this Help Window",
+                "Ctrl + F": "Focus Search/Filter Box",
+                "Ctrl + N": "Focus 'Add URL' Input Box",
+                "l (lowercase L)": "Toggle Log Panel Visibility",
+            }
+        }
+
+        for category, shortcuts in keybinds.items():
+            cat_frame = ttk.Labelframe(main_frame, text=category, padding=10)
+            cat_frame.pack(fill=tk.X, pady=5)
+            for key, desc in shortcuts.items():
+                row = ttk.Frame(cat_frame)
+                row.pack(fill=tk.X, pady=2)
+                key_label = ttk.Label(row, text=key, width=20, font=(get_japanese_font(), 10, 'bold'))
+                key_label.pack(side=tk.LEFT)
+                desc_label = ttk.Label(row, text=desc)
+                desc_label.pack(side=tk.LEFT)
+
+        # --- START: MODIFICATION ---
+        # Helper function to properly handle closing the window
+        def on_close():
+            self.keybind_window.destroy()
+            self.keybind_window = None
+
+        close_btn = ttk.Button(main_frame, text="Close", command=on_close, bootstyle="primary")
+        close_btn.pack(pady=(15, 0))
+        # Set the protocol for the window's close button (the 'X')
+        self.keybind_window.protocol("WM_DELETE_WINDOW", on_close)
+        # --- END: MODIFICATION ---
+
+    # ==================================================================================
+    # --- REFACTOR: This method now builds the settings UI into a parent tab ---
+    # ==================================================================================
+    def _create_settings_tab(self, parent):
+        """Creates the advanced settings UI inside the given parent widget."""
+        # Create a notebook within the settings tab for better organization
+        settings_notebook = ttk.Notebook(parent)
+        settings_notebook.pack(fill=tk.BOTH, expand=True)
+
+        # Create individual tabs for each settings category
+        general_tab = ttk.Frame(settings_notebook, padding=10)
+        settings_notebook.add(general_tab, text="General")
+        playback_tab = ttk.Frame(settings_notebook, padding=10)
+        settings_notebook.add(playback_tab, text="Playback")
+        playlist_tab = ttk.Frame(settings_notebook, padding=10)
+        settings_notebook.add(playlist_tab, text="Playlist")
+        audio_tab = ttk.Frame(settings_notebook, padding=10)
+        settings_notebook.add(audio_tab, text="Audio")
+        profile_tab = ttk.Frame(settings_notebook, padding=10)
+        settings_notebook.add(profile_tab, text="Profiles & Paths")
+        subscriptions_tab = ttk.Frame(settings_notebook, padding=10)
+        settings_notebook.add(subscriptions_tab, text="Subscriptions")
+        
+        # --- General Tab ---
+        gen_frame = ttk.Labelframe(general_tab, text="Application Behavior", padding=10)
+        gen_frame.pack(fill=tk.X, pady=5)
+        self._create_check(gen_frame, "Auto-start Playing on Launch", self.autostart_var, "Automatically start playing when the application launches.")
+        self._create_check(gen_frame, "Save Timestamps & Stats", self.save_timestamp_var, "Save the last video position and daily usage stats.")
+        self._create_check(gen_frame, "Fetch Titles for Web URLs", self.fetch_titles_var, "Automatically fetch titles for web URLs. Can be slow.")
+
+        theme_frame = ttk.Labelframe(general_tab, text="Appearance", padding=10)
+        theme_frame.pack(fill=tk.X, pady=5)
+        theme_menu = ttk.Combobox(theme_frame, textvariable=self.theme_var, values=THEMES, state="readonly", width=15)
+        theme_menu.pack(side=tk.LEFT, padx=5)
+        ToolTip(theme_menu, "Application Theme")
+        ttk.Label(theme_frame, text="Theme:").pack(side=tk.LEFT)
+
+        afk_frame = ttk.Labelframe(general_tab, text="AFK (Away From Keyboard) Detection", padding=10)
+        afk_frame.pack(fill=tk.X, pady=5)
+        if (sys.platform == "win32") or (pynput_mouse and pynput_keyboard):
+            self._create_check(afk_frame, "Pause when AFK", self.afk_enabled_var, "Prevent autoplaying the next video if no mouse/keyboard activity is detected.")
+            afk_entry = ttk.Entry(afk_frame, textvariable=self.afk_timeout_minutes_var, width=5)
+            afk_entry.pack(side=tk.LEFT, padx=10)
+            ToolTip(afk_entry, "AFK Timeout (minutes)")
+            self.afk_timeout_minutes_var.trace("w", self._autosave_settings)
+            self._create_check(afk_frame, "Show AFK status in UI", self.show_afk_status_var, "Display AFK status in the main status label.")
+        else:
+            ttk.Label(afk_frame, text="AFK feature disabled: requires 'pynput' library on this OS.", bootstyle="danger").pack(side=tk.LEFT, padx=5)
+
+        # --- Playback Tab ---
+        browser_frame = ttk.Labelframe(playback_tab, text="Browser Playback", padding=10)
+        browser_frame.pack(fill=tk.X, pady=5)
+        self._create_check(browser_frame, "Headless Mode", self.headless_var, "Run browser in the background without a visible window.")
+        self._create_check(browser_frame, "Keep Browser Open on Stop", self.keep_browser_open_var, "If checked, the browser will not close when you click 'Stop Playing'.")
+        self._create_check(browser_frame, "Unmute Video on Load", self.unmute_var, "Play video with sound (requires browser reload).")
+        self._create_check(browser_frame, "Sync with Video's Native Pause/Play", self.sync_video_pause_var, "Automatically pause/resume playing when the video is paused/resumed in the player.")
+        
+        skip_frame = ttk.Labelframe(playback_tab, text="Video Progression", padding=10)
+        skip_frame.pack(fill=tk.X, pady=5)
+        self._create_check(skip_frame, "Auto-skip When Video Ends", self.auto_skip_var, "Automatically skip to the next URL when the current video ends.")
+        percentage_frame = ttk.Frame(skip_frame)
+        percentage_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(percentage_frame, text="Mark as 'finished' at (%):").pack(side=tk.LEFT, padx=(0, 5))
+        self.percentage_entry = ttk.Entry(percentage_frame, textvariable=self.finished_percentage_var, width=5)
+        self.percentage_entry.pack(side=tk.LEFT)
+        ToolTip(self.percentage_entry, "Threshold to consider a video 'finished'")
+        self.finished_percentage_var.trace("w", self._autosave_settings)
+
+        mpv_playback_frame = ttk.Labelframe(playback_tab, text="MPV Player", padding=10)
+        mpv_playback_frame.pack(fill=tk.X, pady=5)
+        self._create_check(mpv_playback_frame, "Use MPV for Local Files", self.use_mpv_var, "Use MPV media player for local video files instead of browser.")
+
+        self.custom_settings_frame = ttk.Labelframe(playlist_tab, text="Custom Playlist Settings", padding=10)
+        self.custom_settings_frame.pack(fill=tk.X, pady=5)
+        self._create_playlist_check(self.custom_settings_frame, "Expand All Playlists at Start", self.expand_playlists_var, "Scrape all videos from all playlists into one single list before starting.")
+        self._create_playlist_check(self.custom_settings_frame, "Randomize Main List Order", self.random_list_var, "Randomize the order of items in the main list.")
+        self._create_playlist_check(self.custom_settings_frame, "True Random on Skip/End", self.true_random_on_skip_var, "Picks a new random video from the entire pool on every skip/end.")
+        self._create_playlist_check(self.custom_settings_frame, "Smart Shuffle (Unwatched First)", self.smart_shuffle_var, "Shuffles unwatched videos first, then plays watched videos.")
+        self._create_playlist_check(self.custom_settings_frame, "Shuffle Videos Within Each Playlist", self.shuffle_within_playlists_var, "Shuffle the order of videos inside each playlist as it's played.")
+        self._create_playlist_check(self.custom_settings_frame, "Play Playlists Sequentially", self.sequential_playlists_var, "Play each playlist completely before moving to the next item in the list.")
+        self._create_playlist_check(self.custom_settings_frame, "Treat Playlists as Single Videos", self.treat_playlists_as_videos_var, "If checked, playlists will not be expanded and will be treated as single videos.")
+        
+        # --- Audio Tab ---
+        audio_device_frame = ttk.Labelframe(audio_tab, text="Audio Input", padding=10)
+        audio_device_frame.pack(fill=tk.X, pady=5)
+        self.audio_device_menu = ttk.Combobox(audio_device_frame, textvariable=self.audio_device_var, state="readonly")
+        self.audio_device_menu.pack(fill=tk.X, expand=True)
+        ToolTip(self.audio_device_menu, "Audio Input Device (e.g., Stereo Mix)")
+        self.audio_device_menu.bind("<<ComboboxSelected>>", self._autosave_settings)
+        
+        silence_frame = ttk.Labelframe(audio_tab, text="Silence Detection", padding=10)
+        silence_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(silence_frame, text="Play next after (min):").pack(side=tk.LEFT, padx=(0, 5))
+        self.silence_entry = ttk.Entry(silence_frame, textvariable=self.silence_minutes_var, width=5)
         self.silence_entry.pack(side=tk.LEFT)
         ToolTip(self.silence_entry, "How long to wait after silence before playing the next video")
+        
+        threshold_frame = ttk.Labelframe(audio_tab, text="Audio Levels", padding=10)
+        threshold_frame.pack(fill=tk.X, pady=5)
+        self.threshold_slider = self._create_slider_with_label(threshold_frame, "Sound Threshold:", self.sound_threshold_var, 0.1, 2.0, "How loud is 'sound'")
+        self.silence_threshold_slider = self._create_slider_with_label(threshold_frame, "Noise Gate (Silence):", self.silence_threshold_var, 0.01, 0.5, "Ignore quiet background noise below this level")
+        self.audio_gain_slider = self._create_slider_with_label(threshold_frame, "Audio Gain:", self.audio_gain_var, 0.1, 5.0, "Amplify the input audio signal")
 
-        # --- NEW: Simplified Controls ---
-        self.root.style.configure('big.TButton', font=(get_japanese_font(), 12, 'bold'))
-        button_frame = ttk.Frame(bottom_controls_frame)
-        button_frame.pack(fill=tk.X, pady=5, ipady=5)
-        
-        self.start_btn = ttk.Button(button_frame, text="▶️ PLAY", command=self.start_monitoring_with_resume, bootstyle="success", style='big.TButton')
-        self.start_btn.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=2)
-        ToolTip(self.start_btn, "Start playing from last session (Space)")
+        viz_frame = ttk.Labelframe(audio_tab, text="Visualization Mode", padding=10)
+        viz_frame.pack(fill=tk.X, pady=5)
+        ttk.Radiobutton(viz_frame, text="Simple Bar", variable=self.visualization_mode_var, value="bar", command=self.switch_visualization).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(viz_frame, text="Waveform", variable=self.visualization_mode_var, value="waveform", command=self.switch_visualization).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(viz_frame, text="Spectrum", variable=self.visualization_mode_var, value="spectrum", command=self.switch_visualization).pack(side=tk.LEFT, padx=5)
 
-        self.pause_btn = ttk.Button(button_frame, text="⏸️ PAUSE", command=self.pause_monitoring, state=tk.DISABLED, bootstyle="warning", style='big.TButton')
-        self.pause_btn.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=2)
-        ToolTip(self.pause_btn, "Pause playback (Space)")
+        # --- Profiles & Paths Tab ---
+        profile_management_frame = ttk.Labelframe(profile_tab, text="Profile Management", padding="10")
+        profile_management_frame.pack(fill=tk.X, pady=5)
+        self.profile_combobox = ttk.Combobox(profile_management_frame, textvariable=self.active_profile_name, state="readonly")
+        self.profile_combobox.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ToolTip(self.profile_combobox, "Switch between saved setting profiles")
+        self.profile_combobox.bind("<<ComboboxSelected>>", self.on_profile_select)
+        ttk.Button(profile_management_frame, text="New", command=self.new_profile, bootstyle="info-outline").pack(side=tk.LEFT, padx=2)
+        ttk.Button(profile_management_frame, text="Copy", command=self.copy_profile, bootstyle="info-outline").pack(side=tk.LEFT, padx=2)
+        ttk.Button(profile_management_frame, text="Save", command=self.save_profile, bootstyle="success-outline").pack(side=tk.LEFT, padx=2)
+        ttk.Button(profile_management_frame, text="Delete", command=self.delete_profile, bootstyle="danger-outline").pack(side=tk.LEFT, padx=2)
+        
+        paths_frame = ttk.Labelframe(profile_tab, text="Executable & Profile Paths", padding="10")
+        paths_frame.pack(fill=tk.X, pady=5)
+        chrome_profile_frame = ttk.Frame(paths_frame)
+        chrome_profile_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(chrome_profile_frame, text="Chrome User Data:", width=18).pack(side=tk.LEFT)
+        self.profile_path_entry = ttk.Entry(chrome_profile_frame, textvariable=self.profile_path_var)
+        self.profile_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        # --- START: NEWLY ADDED WIDGET ---
+        ttk.Button(chrome_profile_frame, text="Browse", command=lambda: self.browse_folder_path(self.profile_path_var), bootstyle="secondary-outline").pack(side=tk.LEFT)
+        # --- END: NEWLY ADDED WIDGET ---
+        ToolTip(self.profile_path_entry, "Chrome User Data Directory (e.g., C:\\Users\\...\\AppData\\Local\\Google\\Chrome\\User Data)")
+        self.profile_path_var.trace("w", self._autosave_settings)
+        
+        chrome_name_frame = ttk.Frame(paths_frame)
+        chrome_name_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(chrome_name_frame, text="Chrome Profile Name:", width=18).pack(side=tk.LEFT)
+        self.profile_name_entry = ttk.Entry(chrome_name_frame, textvariable=self.profile_name_var)
+        self.profile_name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ToolTip(self.profile_name_entry, "Chrome Profile Name (e.g., Profile 1)")
+        self.profile_name_var.trace("w", self._autosave_settings)
 
-        self.stop_btn = ttk.Button(button_frame, text="⏹️ STOP", command=self.stop_monitoring, state=tk.DISABLED, bootstyle="danger", style='big.TButton')
-        self.stop_btn.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=2)
-        ToolTip(self.stop_btn, "Stop playback (Esc)")
+        mpv_path_frame = ttk.Frame(paths_frame)
+        mpv_path_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(mpv_path_frame, text="MPV Path:", width=18).pack(side=tk.LEFT)
+        self.mpv_path_entry = ttk.Entry(mpv_path_frame, textvariable=self.mpv_path_var)
+        self.mpv_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        ToolTip(self.mpv_path_entry, "Path to MPV executable")
+        self.mpv_path_var.trace("w", self._autosave_settings)
+        ttk.Button(mpv_path_frame, text="Browse", command=self.browse_mpv_path, bootstyle="secondary-outline").pack(side=tk.LEFT)
 
-        status_frame = ttk.Labelframe(bottom_controls_frame, text="Status", padding="10")
-        status_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
-        
-        status_top = ttk.Frame(status_frame)
-        status_top.pack(fill=tk.X)
-        self.status_label = ttk.Label(status_top, text="Status: 👂 Listening", font=(get_japanese_font(), 12, 'bold'))
-        self.status_label.pack(side=tk.LEFT)
-        self.countdown_label = ttk.Label(status_top, textvariable=self.countdown_var, font=(get_japanese_font(), 11, 'italic'), bootstyle="secondary")
-        self.countdown_label.pack(side=tk.LEFT, padx=10)
-        
-        # ENHANCED: Silence indicator (add after countdown_label)
-        self.silence_indicator = ttk.Label(status_top, text="", font=(get_japanese_font(), 11))
-        self.silence_indicator.pack(side=tk.LEFT, padx=10)
-        
-        self.time_label = ttk.Label(status_top, text="Time: 0h 0m 0s", font=(get_japanese_font(), 12))
-        self.time_label.pack(side=tk.RIGHT)
-        
-        # ENHANCED: Audio visualization container (replace sound_bar_canvas section)
-        self.visualization_container = ttk.Frame(status_frame, height=60)
-        self.visualization_container.pack(fill=tk.X, pady=(5, 0))
-        self.visualization_container.pack_propagate(False)
-        
-        # Initialize with a placeholder, switch_visualization will populate it
-        self.sound_bar_canvas = None
-        
-        log_toggle_frame = ttk.Frame(status_frame)
-        log_toggle_frame.pack(fill=tk.X, pady=(5,0))
-        self.toggle_log_btn = ttk.Button(log_toggle_frame, text="Show Logs ▼", command=self.toggle_log, bootstyle="light-outline")
-        self.toggle_log_btn.pack(side=tk.LEFT)
-
-        self.log_text = scrolledtext.ScrolledText(status_frame, state='disabled', height=10, wrap=tk.WORD, font=(get_japanese_font(), 10))
-        
-        stats_button_frame = ttk.Frame(bottom_controls_frame)
-        stats_button_frame.pack(fill=tk.X)
-        
-        self.start_fresh_btn = ttk.Button(stats_button_frame, text="🔁 Play from Beginning", command=self.start_monitoring_from_beginning, bootstyle="success-outline")
-        self.start_fresh_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
-        
-        ttk.Button(stats_button_frame, text="📊 View Statistics", command=self.view_stats, bootstyle="info-outline").pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
-        # ✅ FEATURE: Advanced Settings Window - Button now calls the new toggle function
-        self.toggle_settings_btn = ttk.Button(stats_button_frame, text="⚙️ Advanced Settings", command=self.toggle_settings_window, bootstyle="secondary-outline")
-        self.toggle_settings_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2, 0))
-
-        # Add at the end of create_widgets:
-        self.root.after(100, self.initialize_visualization)
+        # --- Subscriptions Tab ---
+        subs_frame = ttk.Labelframe(subscriptions_tab, text="Channel/Folder Subscriptions", padding=10)
+        subs_frame.pack(fill=tk.BOTH, expand=True)
+        self.subs_tree = ttk.Treeview(subs_frame, columns=("source", "type"), show="headings", height=5)
+        self.subs_tree.heading("source", text="Source")
+        self.subs_tree.heading("type", text="Type")
+        self.subs_tree.pack(fill=tk.BOTH, expand=True, pady=(0,5))
+        subs_buttons = ttk.Frame(subs_frame)
+        subs_buttons.pack(fill=tk.X)
+        ttk.Button(subs_buttons, text="Add", command=self.add_subscription, bootstyle="info-outline").pack(side=tk.LEFT, padx=2)
+        ttk.Button(subs_buttons, text="Remove", command=self.remove_subscription, bootstyle="danger-outline").pack(side=tk.LEFT, padx=2)
+        ttk.Button(subs_buttons, text="Refresh All", command=self.refresh_subscriptions, bootstyle="success-outline").pack(side=tk.RIGHT, padx=2)
 
 
     def _create_check(self, parent_widget, text, var, tip):
@@ -684,169 +932,13 @@ class AudioMonitorApp:
     def _create_slider_with_label(self, parent_widget, label_text, variable, from_, to, tip):
         """Creates a labeled slider with a tooltip and autosave command."""
         frame = ttk.Frame(parent_widget)
-        frame.pack(fill=tk.X, expand=True, pady=(10, 0))
-        label = ttk.Label(frame, text=label_text, width=15)
+        frame.pack(fill=tk.X, expand=True, pady=5)
+        label = ttk.Label(frame, text=label_text, width=18)
         label.pack(side=tk.LEFT, padx=(0, 10))
         slider = ttk.Scale(frame, from_=from_, to=to, variable=variable, command=self._autosave_settings)
         slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ToolTip(slider, tip)
         return slider    
-
-    # ✅ FEATURE: Advanced Settings Window - All settings UI is now created in this separate method.
-    def _create_settings_panel(self, parent):
-        """Creates the advanced settings UI inside the given parent widget."""
-        settings_notebook = ttk.Notebook(parent)
-        settings_notebook.pack(fill=tk.BOTH, pady=5, expand=True, padx=10)
-
-        general_tab = ttk.Frame(settings_notebook, padding=10)
-        settings_notebook.add(general_tab, text="General")
-        paths_tab = ttk.Frame(settings_notebook, padding=10)
-        settings_notebook.add(paths_tab, text="Paths")
-        profile_tab = ttk.Frame(settings_notebook, padding=10)
-        settings_notebook.add(profile_tab, text="Profiles")
-        playback_tab = ttk.Frame(settings_notebook, padding=10)
-        settings_notebook.add(playback_tab, text="Playback")
-        playlist_tab = ttk.Frame(settings_notebook, padding=10)
-        settings_notebook.add(playlist_tab, text="Playlist")
-        subscriptions_tab = ttk.Frame(settings_notebook, padding=10)
-        settings_notebook.add(subscriptions_tab, text="Subscriptions")
-        audio_tab = ttk.Frame(settings_notebook, padding=10)
-        settings_notebook.add(audio_tab, text="Audio")
-
-        # --- Subscriptions Tab ---
-        subs_frame = ttk.Labelframe(subscriptions_tab, text="Channel/Folder Subscriptions", padding=10)
-        subs_frame.pack(fill=tk.BOTH, expand=True)
-        self.subs_tree = ttk.Treeview(subs_frame, columns=("source", "type"), show="headings", height=5)
-        self.subs_tree.heading("source", text="Source")
-        self.subs_tree.heading("type", text="Type")
-        self.subs_tree.pack(fill=tk.BOTH, expand=True)
-        subs_buttons = ttk.Frame(subs_frame)
-        subs_buttons.pack(fill=tk.X, pady=5)
-        ttk.Button(subs_buttons, text="Add", command=self.add_subscription, bootstyle="info-outline").pack(side=tk.LEFT, padx=2)
-        ttk.Button(subs_buttons, text="Remove", command=self.remove_subscription, bootstyle="danger-outline").pack(side=tk.LEFT, padx=2)
-        ttk.Button(subs_buttons, text="Refresh All", command=self.refresh_subscriptions, bootstyle="success-outline").pack(side=tk.RIGHT, padx=2)
-
-        # --- Playlist Tab ---
-        quick_mode_frame = ttk.Labelframe(playlist_tab, text="Quick Mode", padding=10)
-        quick_mode_frame.pack(fill=tk.X, pady=5)
-        self.playlist_mode_combo = ttk.Combobox(quick_mode_frame, textvariable=self.playlist_mode_var,
-                                                values=["Sequential", "Shuffle All", "True Random", "Smart Shuffle", "Custom"],
-                                                state="readonly")
-        self.playlist_mode_combo.pack(fill=tk.X, expand=True)
-        ToolTip(self.playlist_mode_combo, "Select a playback mode preset")
-        self.playlist_mode_combo.bind("<<ComboboxSelected>>", self.on_playlist_mode_change)
-
-        self.custom_settings_frame = ttk.Labelframe(playlist_tab, text="Custom Settings", padding=10)
-        self.custom_settings_frame.pack(fill=tk.X, pady=5)
-
-        self._create_playlist_check(self.custom_settings_frame, "Expand All Playlists", self.expand_playlists_var, "Scrape all videos from all playlists into one single list before starting.")
-        self._create_playlist_check(self.custom_settings_frame, "Randomize List Order", self.random_list_var, "Randomize the order of items in the main list.")
-        self._create_playlist_check(self.custom_settings_frame, "True Random on Skip", self.true_random_on_skip_var, "Picks a new random video from the entire pool on every skip/end.")
-        self._create_playlist_check(self.custom_settings_frame, "Smart Shuffle", self.smart_shuffle_var, "Shuffles unwatched videos first, then plays watched videos.")
-        self._create_playlist_check(self.custom_settings_frame, "Shuffle Videos Within Playlists", self.shuffle_within_playlists_var, "Shuffle the order of videos inside each playlist as it's played.")
-        self._create_playlist_check(self.custom_settings_frame, "Sequential Playlist Playback", self.sequential_playlists_var, "Play each playlist completely before moving to the next item in the list.")
-        self._create_playlist_check(self.custom_settings_frame, "Treat all playlists as single videos", self.treat_playlists_as_videos_var, "If checked, playlists will not be expanded and will be treated as single videos.")
-        
-        # --- Profile Tab ---
-        profile_management_frame = ttk.Labelframe(profile_tab, text="Profile Management", padding="10")
-        profile_management_frame.pack(fill=tk.X, pady=5)
-        self.profile_combobox = ttk.Combobox(profile_management_frame, textvariable=self.active_profile_name, state="readonly")
-        self.profile_combobox.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        ToolTip(self.profile_combobox, "Switch between saved setting profiles")
-        self.profile_combobox.bind("<<ComboboxSelected>>", self.on_profile_select)
-        ttk.Button(profile_management_frame, text="New", command=self.new_profile, bootstyle="info-outline").pack(side=tk.LEFT, padx=5)
-        ttk.Button(profile_management_frame, text="Copy", command=self.copy_profile, bootstyle="info-outline").pack(side=tk.LEFT, padx=5)
-        ttk.Button(profile_management_frame, text="Save", command=self.save_profile, bootstyle="success-outline").pack(side=tk.LEFT, padx=5)
-        ttk.Button(profile_management_frame, text="Delete", command=self.delete_profile, bootstyle="danger-outline").pack(side=tk.LEFT, padx=5)
-        
-        # --- Paths Tab ---
-        chrome_profile_frame = ttk.Frame(paths_tab, padding=5)
-        chrome_profile_frame.pack(fill=tk.X)
-        self.profile_path_entry = ttk.Entry(chrome_profile_frame, textvariable=self.profile_path_var, width=50)
-        self.profile_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
-        ToolTip(self.profile_path_entry, "Chrome User Data Directory (e.g., C:\\Users\\...\\AppData\\Local\\Google\\Chrome\\User Data)")
-        self.profile_path_var.trace("w", self._autosave_settings)
-
-        self.profile_name_entry = ttk.Entry(chrome_profile_frame, textvariable=self.profile_name_var, width=20)
-        self.profile_name_entry.pack(side=tk.LEFT, padx=(0, 10))
-        ToolTip(self.profile_name_entry, "Chrome Profile Name (e.g., Profile 1)")
-        self.profile_name_var.trace("w", self._autosave_settings)
-
-        mpv_frame = ttk.Frame(paths_tab, padding=5)
-        mpv_frame.pack(fill=tk.X)
-        self.mpv_path_entry = ttk.Entry(mpv_frame, textvariable=self.mpv_path_var, width=50)
-        self.mpv_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        ToolTip(self.mpv_path_entry, "Path to MPV executable")
-        self.mpv_path_var.trace("w", self._autosave_settings)
-        ttk.Button(mpv_frame, text="Browse", command=self.browse_mpv_path, bootstyle="secondary").pack(side=tk.LEFT, padx=(0, 10))
-        
-        # --- General Tab ---
-        self._create_check(general_tab, "Headless", self.headless_var, "Run browser in the background without a visible window.")
-        self._create_check(general_tab, "Fetch Titles", self.fetch_titles_var, "Automatically fetch titles for web URLs. Can be slow.")
-        self._create_check(general_tab, "Save Timestamps", self.save_timestamp_var, "Save the last video position and daily usage stats.")
-        self._create_check(general_tab, "Keep Browser Open", self.keep_browser_open_var, "If checked, the browser will not close when you click 'Stop Playing'.")
-        self._create_check(general_tab, "Auto-start Playing", self.autostart_var, "Automatically start playing when the application launches.")
-        
-        gen_row2 = ttk.Frame(general_tab)
-        gen_row2.pack(fill=tk.X, pady=2)
-        self.delay_entry = ttk.Entry(gen_row2, textvariable=self.delay_minutes_var, width=5)
-        self.delay_entry.pack(side=tk.LEFT, padx=5)
-        ToolTip(self.delay_entry, "Start Delay (minutes)")
-        self.delay_minutes_var.trace("w", self._autosave_settings)
-        
-        theme_menu = ttk.Combobox(gen_row2, textvariable=self.theme_var, values=THEMES, state="readonly", width=10)
-        theme_menu.pack(side=tk.RIGHT, padx=5)
-        ToolTip(theme_menu, "Application Theme")
-        
-        gen_row3 = ttk.Frame(general_tab)
-        gen_row3.pack(fill=tk.X, pady=2)
-        if (sys.platform == "win32") or (pynput_mouse and pynput_keyboard):
-            self._create_check(gen_row3, "Pause when AFK", self.afk_enabled_var, "Prevent autoplaying the next video if no mouse/keyboard activity is detected.")
-            afk_entry = ttk.Entry(gen_row3, textvariable=self.afk_timeout_minutes_var, width=5)
-            afk_entry.pack(side=tk.LEFT, padx=10)
-            ToolTip(afk_entry, "AFK Timeout (minutes)")
-            self.afk_timeout_minutes_var.trace("w", self._autosave_settings)
-            self._create_check(gen_row3, "Show AFK status in UI", self.show_afk_status_var, "Display AFK status in the main status label.")
-        else:
-            ttk.Label(gen_row3, text="AFK feature disabled: requires 'pynput' library on this OS.", bootstyle="danger").pack(side=tk.LEFT, padx=5)
-        
-        # --- Playback Tab ---
-        self._create_check(playback_tab, "Auto-skip Ended", self.auto_skip_var, "Automatically skip to the next URL when the current video ends.")
-        self._create_check(playback_tab, "Sync with Video Pause", self.sync_video_pause_var, "Automatically pause/resume playing when the video is paused/resumed in the player.")
-        self._create_check(playback_tab, "Unmute Video", self.unmute_var, "Play video with sound (requires browser reload).")
-        self._create_check(playback_tab, "Use MPV for Local Files", self.use_mpv_var, "Use MPV media player for local video files instead of browser.")
-        
-        percentage_frame = ttk.Frame(playback_tab)
-        percentage_frame.pack(fill=tk.X, pady=5)
-        self.percentage_entry = ttk.Entry(percentage_frame, textvariable=self.finished_percentage_var, width=5)
-        self.percentage_entry.pack(side=tk.LEFT, padx=(0, 5))
-        ToolTip(self.percentage_entry, "Finished Threshold (%)")
-        self.finished_percentage_var.trace("w", self._autosave_settings)
-
-        # --- Audio Tab ---
-        audio_device_frame = ttk.Frame(audio_tab)
-        audio_device_frame.pack(fill=tk.X, expand=True)
-        self.audio_device_menu = ttk.Combobox(audio_device_frame, textvariable=self.audio_device_var, state="readonly")
-        self.audio_device_menu.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ToolTip(self.audio_device_menu, "Audio Input Device (e.g., Stereo Mix)")
-        self.audio_device_menu.bind("<<ComboboxSelected>>", self._autosave_settings)
-        
-        viz_frame = ttk.Labelframe(audio_tab, text="Visualization Mode", padding=10)
-        viz_frame.pack(fill=tk.X, pady=(10, 0))
-        
-        ttk.Radiobutton(viz_frame, text="Simple Bar", variable=self.visualization_mode_var, value="bar", command=self.switch_visualization).pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(viz_frame, text="Waveform", variable=self.visualization_mode_var, value="waveform", command=self.switch_visualization).pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(viz_frame, text="Spectrum", variable=self.visualization_mode_var, value="spectrum", command=self.switch_visualization).pack(side=tk.LEFT, padx=5)
-
-        self.threshold_slider = self._create_slider_with_label(audio_tab, "Sound Threshold:", self.sound_threshold_var, 0.1, 2.0, "How loud is 'sound'")
-        self.silence_threshold_slider = self._create_slider_with_label(audio_tab, "Noise Gate (Silence):", self.silence_threshold_var, 0.01, 0.5, "Ignore quiet background noise below this level")
-        self.audio_gain_slider = self._create_slider_with_label(audio_tab, "Audio Gain:", self.audio_gain_var, 0.1, 5.0, "Amplify the input audio signal")
-
-        # --- Close Button ---
-        close_settings_frame = ttk.Frame(parent)
-        close_settings_frame.pack(fill=tk.X, side=tk.BOTTOM, pady=(10,5), padx=10)
-        ttk.Button(close_settings_frame, text="Close Settings", command=self.toggle_settings_window, bootstyle="secondary").pack()
-
 
     def initialize_visualization(self):
         """Initialize the audio visualization based on selected mode."""
@@ -856,7 +948,6 @@ class AudioMonitorApp:
         """Switch between different visualization modes."""
         mode = self.visualization_mode_var.get()
         
-        # FIX: Properly stop and clear the previous animation and widgets
         if self.visualization_animation:
             self.visualization_animation.event_source.stop()
             self.visualization_animation = None
@@ -871,7 +962,7 @@ class AudioMonitorApp:
             self.sound_bar_canvas = tk.Canvas(self.visualization_container, height=20, 
                                               bg=self.root.style.colors.bg, highlightthickness=0)
             self.sound_bar_canvas.pack(fill=tk.BOTH, expand=True, pady=(20,20))
-            self.update_sound_bar() # FIX: Restart the update loop
+            self.update_sound_bar()
             
         elif mode == "waveform" and MATPLOTLIB_AVAILABLE:
             self.create_waveform_visualization()
@@ -882,7 +973,6 @@ class AudioMonitorApp:
             if mode != "bar":
                 self.log(f"Matplotlib not available for '{mode}' mode. Falling back to simple bar.", "orange")
                 self.visualization_mode_var.set("bar")
-                # Recursively call to ensure the bar is created
                 self.root.after(10, self.switch_visualization)
 
     def create_waveform_visualization(self):
@@ -959,7 +1049,6 @@ class AudioMonitorApp:
             
             self.waveform_line.set_color(line_color)
             
-            # FIX: Explicitly redraw the canvas
             if self.waveform_canvas:
                 self.waveform_canvas.draw()
         
@@ -989,7 +1078,6 @@ class AudioMonitorApp:
                 else:
                     bar.set_color(self.root.style.colors.success)
             
-            # FIX: Explicitly redraw the canvas
             if self.spectrum_canvas:
                 self.spectrum_canvas.draw()
         
@@ -997,7 +1085,6 @@ class AudioMonitorApp:
 
     def update_visualization_theme(self):
         """Update visualization colors when theme changes."""
-        # FIX: Recreate the visualization to apply new theme colors
         self.switch_visualization()
 
     def update_silence_indicator(self, is_silence):
@@ -1011,17 +1098,15 @@ class AudioMonitorApp:
         """FIX: Debounced logic to prevent rapid flickering of the silence indicator."""
         now = time.time()
         
-        # Check if we should switch to SILENCE state
         if not self.current_indicator_state and (now - self.last_sound_time > self.silence_debounce_time):
-            self.current_indicator_state = True # Now in silence state
+            self.current_indicator_state = True 
             self.update_silence_indicator(True)
             
-        # Check if we should switch to ACTIVE state
         elif self.current_indicator_state and (now - self.last_silence_time > self.silence_debounce_time):
-            self.current_indicator_state = False # Now in active state
+            self.current_indicator_state = False
             self.update_silence_indicator(False)
 
-        self.root.after(100, self.update_flicker_free_indicator) # Loop every 100ms
+        self.root.after(100, self.update_flicker_free_indicator) 
 
     def set_placeholder_thumbnail(self):
         """Creates a default placeholder image for the Now Playing card."""
@@ -1033,17 +1118,6 @@ class AudioMonitorApp:
         draw.text((60, 45), text, fill=text_color, anchor="mm")
         self.now_playing_thumbnail_photo = ImageTk.PhotoImage(placeholder)
         self.now_playing_thumbnail_label.config(image=self.now_playing_thumbnail_photo)
-
-    # ✅ FIX: This function now correctly toggles the pre-built settings window
-    def toggle_settings_window(self):
-        """Shows or hides the advanced settings Toplevel window."""
-        if self.settings_window.winfo_viewable():
-            self.settings_window.withdraw()
-            self.toggle_settings_btn.config(text="⚙️ Advanced Settings")
-        else:
-            self.settings_window.deiconify()
-            self.settings_window.lift()
-            self.toggle_settings_btn.config(text="⚙️ Hide Settings")
 
     def toggle_log(self):
         """Shows or hides the log text widget."""
@@ -1063,7 +1137,6 @@ class AudioMonitorApp:
         self.url_tree.delete(*self.url_tree.get_children())
         
         for item in self.all_tree_items:
-            # Advanced filtering
             if 'type:' in query:
                 if item['type'].lower() != query.split('type:')[1].strip():
                     continue
@@ -1088,7 +1161,6 @@ class AudioMonitorApp:
         selected_id = selected_items[0]
         selected_url = self.url_tree.item(selected_id, 'values')[1]
 
-        # Find and move the item in the master list
         item_to_move = None
         for i, item in enumerate(self.all_tree_items):
             if item['url'] == selected_url:
@@ -1097,13 +1169,11 @@ class AudioMonitorApp:
         
         if item_to_move:
             if self.is_monitoring:
-                # Insert after the currently playing item in the monitor queue
                 self.main_queue.insert(self.main_queue_index + 1, item_to_move['url'])
                 self.log(f"'{self.get_display_name(item_to_move['url'])}' will play next.", "blue")
             else:
-                # Move to the top of the visual list if not monitoring
                 self.all_tree_items.insert(0, item_to_move)
-                self.filter_treeview() # Refresh the treeview to show the new order
+                self.filter_treeview() 
                 self.log(f"Moved '{self.get_display_name(item_to_move['url'])}' to the top of the list.", "blue")
 
     def mark_as_watched(self):
@@ -1134,7 +1204,6 @@ class AudioMonitorApp:
         url = self.url_tree.item(item_id, 'values')[1]
         clean_url = self._clean_url(url)
         
-        # Search through all days to remove any timestamp for this URL
         for day, data in self.stats.items():
             if isinstance(data, dict) and 'timestamps' in data:
                 if clean_url in data['timestamps']:
@@ -1143,36 +1212,53 @@ class AudioMonitorApp:
         self.save_stats()
         self.log(f"Marked '{self.get_display_name(url)}' as unwatched.", "blue")
 
-    # --- START MODIFICATION: Improved Playlist Mode Handling ---
     def on_playlist_mode_change(self, event=None):
         """Applies settings based on the selected quick mode and enables/disables custom checkboxes."""
-        mode = self.playlist_mode_var.get()
+        new_mode = self.playlist_mode_var.get()
+
+        # --- START: NEW DYNAMIC CHANGE LOGIC ---
+        if self.is_monitoring:
+            if new_mode == "True Random":
+                messagebox.showinfo(
+                    "Mode Change Required",
+                    "'True Random' mode cannot be switched to during playback.\nPlease stop and start again to use this mode.",
+                    parent=self.root
+                )
+                # Revert the dropdown to the previous selection
+                self.playlist_mode_var.set(self.previous_playlist_mode)
+                return
+            
+            # If monitoring and not True Random, rebuild the queue
+            self.rebuild_queue_dynamically(new_mode)
         
-        # Enable or disable the custom settings checkboxes based on the mode
-        if self.custom_settings_frame: # Ensure the frame has been created
-            if mode == "Custom":
+        self.previous_playlist_mode = new_mode
+        # --- END: NEW DYNAMIC CHANGE LOGIC ---
+        
+        # This part remains the same: enable/disable checkboxes based on mode
+        if self.custom_settings_frame:
+            if new_mode == "Custom":
                 for child in self.custom_settings_frame.winfo_children():
                     child.config(state=tk.NORMAL)
             else:
                 for child in self.custom_settings_frame.winfo_children():
                     child.config(state=tk.DISABLED)
 
-        # Apply settings for preset modes
-        if mode != "Custom":
+        if new_mode != "Custom":
             settings = {
                 'expand_playlists': False, 'random_list': False,
                 'true_random_on_skip': False, 'smart_shuffle': False,
                 'shuffle_within_playlists': False, 'sequential_playlists': False
             }
             
-            if mode == "Sequential":
+            if new_mode == "Sequential":
                 settings['sequential_playlists'] = True
-            elif mode == "Shuffle All":
+                settings['expand_playlists'] = True
+            elif new_mode == "Shuffle All":
                 settings['expand_playlists'] = True
                 settings['random_list'] = True
-            elif mode == "True Random":
+            elif new_mode == "True Random":
                 settings['true_random_on_skip'] = True
-            elif mode == "Smart Shuffle":
+            elif new_mode == "Smart Shuffle":
                 settings['smart_shuffle'] = True
                 
             self.expand_playlists_var.set(settings['expand_playlists'])
@@ -1182,12 +1268,65 @@ class AudioMonitorApp:
             self.shuffle_within_playlists_var.set(settings['shuffle_within_playlists'])
             self.sequential_playlists_var.set(settings['sequential_playlists'])
 
+    def rebuild_queue_dynamically(self, new_mode):
+        """Rebuilds the upcoming song queue when the playlist mode is changed during playback."""
+        self.log(f"Dynamically changing playlist mode to: {new_mode}", "blue")
+
+        # Get the full, original list of URLs in their visual order
+        original_urls = [item['url'] for item in self.all_tree_items]
+        
+        # If the current queue is empty or something is wrong, abort.
+        if not self.main_queue or not self.current_url:
+            self.log("Cannot rebuild queue: playback not in a valid state.", "orange")
+            return
+
+        # Preserve the currently playing song and what has already been played
+        played_urls = self.main_queue[:self.main_queue_index]
+        upcoming_urls = []
+
+        # --- Determine the new list of upcoming songs based on the selected mode ---
+        if new_mode == "Sequential":
+            # Find the current song in the original, sequential list
+            try:
+                current_original_index = original_urls.index(self.current_url)
+                # The new upcoming list is everything after the current song in the original order
+                upcoming_urls = original_urls[current_original_index + 1:]
+            except ValueError:
+                # Fallback: if current song isn't in the main list, just use what's left in the queue
+                upcoming_urls = self.main_queue[self.main_queue_index + 1:]
+
+        elif new_mode in ["Shuffle All", "Smart Shuffle"]:
+            # For shuffle modes, we shuffle everything that hasn't been played yet.
+            # This includes the current song's original position and everything after.
+            try:
+                current_original_index = original_urls.index(self.current_url)
+                # Pool of songs to be shuffled = everything from the current song onwards in the original list
+                shuffle_pool = original_urls[current_original_index + 1:]
+                random.shuffle(shuffle_pool)
+                upcoming_urls = shuffle_pool
+            except ValueError:
+                # Fallback: if current song isn't in the main list, just shuffle what's left in the queue
+                upcoming_urls = self.main_queue[self.main_queue_index + 1:]
+                random.shuffle(upcoming_urls)
+        
+        else: # For "Custom" or other modes, we don't change the order
+            upcoming_urls = self.main_queue[self.main_queue_index + 1:]
+
+
+        # --- Assemble the new queue ---
+        # The new queue is [what was played] + [current song] + [newly ordered upcoming songs]
+        self.main_queue = played_urls + [self.current_url] + upcoming_urls
+        
+        # The index of the current song doesn't change in this new structure
+        # self.main_queue_index remains the same.
+
+        self.log(f"Upcoming queue rebuilt with {len(upcoming_urls)} songs.", "green")
+        self.update_playlist_info() # Refresh the UI to show the new queue length/order
+
     def on_custom_setting_change(self, *args):
         """Switches the mode to 'Custom' and re-enables checkboxes."""
         self.playlist_mode_var.set("Custom")
-        # Explicitly call the handler to re-enable all checkboxes
         self.on_playlist_mode_change()
-    # --- END MODIFICATION ---
         
     def on_drag_start(self, event):
         """Records the item being dragged."""
@@ -1222,7 +1361,6 @@ class AudioMonitorApp:
         if not self.browser:
             return False
         try:
-            # A lightweight command to check if the browser is alive
             _ = self.browser.window_handles
             return True
         except WebDriverException:
@@ -1235,31 +1373,25 @@ class AudioMonitorApp:
         stats_window.transient(self.root)
         stats_window.grab_set()
 
-        # Load saved window geometry or use default
         stats_geometry = getattr(self, 'stats_window_geometry', None)
         if stats_geometry:
             try:
                 stats_window.geometry(stats_geometry)
             except tk.TclError:
-                # If saved geometry is invalid, use default
-                width = 800
-                height = 600
+                width = 800; height = 600
                 x = (stats_window.winfo_screenwidth() // 2) - (width // 2)
                 y = (stats_window.winfo_screenheight() // 2) - (height // 2)
                 stats_window.geometry(f"{width}x{height}+{x}+{y}")
         else:
-            # Default geometry
-            width = 800
-            height = 600
+            width = 800; height = 600
             x = (stats_window.winfo_screenwidth() // 2) - (width // 2)
             y = (stats_window.winfo_screenheight() // 2) - (height // 2)
             stats_window.geometry(f"{width}x{height}+{x}+{y}")
 
-        # Save window geometry when closing
         def on_stats_window_close():
             try:
                 self.stats_window_geometry = stats_window.geometry()
-                self.save_profile()  # Save the geometry to the profile
+                self.save_profile()
             except tk.TclError:
                 pass
             stats_window.destroy()
@@ -1272,116 +1404,84 @@ class AudioMonitorApp:
         notebook = ttk.Notebook(main_stats_frame)
         notebook.pack(fill=tk.BOTH, expand=True)
 
-        # --- Daily Breakdown Tab (Clean Table Style) ---
         daily_breakdown_tab = ttk.Frame(notebook, padding=10)
         notebook.add(daily_breakdown_tab, text="Daily Breakdown")
         
-        # Header
         header_label = ttk.Label(daily_breakdown_tab, text="DAILY PLAYING BREAKDOWN", 
                                 font=(get_japanese_font(), 16, 'bold'))
         header_label.pack(pady=(0, 20))
         
-        # Create table frame
         table_frame = ttk.Frame(daily_breakdown_tab)
         table_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Table with columns: Date, Time, Visual
         columns = ("Date", "Time", "Visual")
         tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=15)
         
-        # Define headings
         tree.heading("Date", text="Date")
         tree.heading("Time", text="Time")
         tree.heading("Visual", text="Visual")
         
-        # Configure column widths - Date and Time centered, Visual left-aligned
         tree.column("Date", width=120, anchor='center')
         tree.column("Time", width=120, anchor='center')
         tree.column("Visual", width=400, anchor='w')
         
-        # Add scrollbar
         scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
         
-        # Pack table and scrollbar
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # Populate table with data
         has_daily_data = any(isinstance(data, dict) and day != 'url_stats' for day, data in self.stats.items())
         
         if has_daily_data:
-            # Sort days in reverse chronological order
             sorted_days = sorted([day for day in self.stats.keys() if day != 'url_stats' and isinstance(self.stats[day], dict)], reverse=True)
             
-            # Calculate max time for visual bar scaling
             max_time = max(data.get('total_monitored_time', 0) for day, data in self.stats.items() 
                           if isinstance(data, dict) and day != 'url_stats') if sorted_days else 1
             
             for day in sorted_days:
                 data = self.stats[day]
-                
-                # Calculate stats for this day
                 total_time = data.get('total_monitored_time', 0)
-                
-                # Format time
                 hours = int(total_time // 3600)
                 minutes = int((total_time % 3600) // 60)
                 time_str = f"{hours}h {minutes}m"
-                
-                # Create visual bar (using Unicode block characters)
                 bar_length = int((total_time / max_time) * 40) if max_time > 0 else 0
                 visual_bar = "█" * bar_length
-                
-                # Insert into table
                 tree.insert("", tk.END, values=(day, time_str, visual_bar))
         else:
-            # Show "no data" message
             tree.insert("", tk.END, values=("No data", "0h 0m", ""))
 
-        # --- Overview Tab ---
         overview_tab = ttk.Frame(notebook, padding=10)
         notebook.add(overview_tab, text="Overview")
         
         if has_daily_data:
-            # Header
             overview_header = ttk.Label(overview_tab, text="LIFETIME PLAYING OVERVIEW", 
                                        font=(get_japanese_font(), 16, 'bold'))
             overview_header.pack(pady=(0, 30))
             
-            # Calculate overall statistics
             total_days = len([day for day in self.stats.keys() if day != 'url_stats' and isinstance(self.stats[day], dict)])
             total_time_all = sum(data.get('total_monitored_time', 0) for data in self.stats.values() if isinstance(data, dict))
             
-            # Format total time
             total_hours = int(total_time_all // 3600)
             total_minutes = int((total_time_all % 3600) // 60)
             total_seconds = int(total_time_all % 60)
             
-            # Calculate average time per day
             avg_time_per_day = total_time_all / total_days if total_days > 0 else 0
             avg_hours = int(avg_time_per_day // 3600)
             avg_minutes = int((avg_time_per_day % 3600) // 60)
             avg_seconds = int(avg_time_per_day % 60)
             
-            # Create main stats frame without border
             stats_main_frame = ttk.Frame(overview_tab)
             stats_main_frame.pack(fill=tk.X, padx=50)
             
-            # Create individual stat rows
             def create_stat_row(parent, label, value):
                 row_frame = ttk.Frame(parent)
                 row_frame.pack(fill=tk.X, pady=10)
-                
-                label_widget = ttk.Label(row_frame, text=label + ":", 
-                                       font=(get_japanese_font(), 12))
+                label_widget = ttk.Label(row_frame, text=label + ":", font=(get_japanese_font(), 12))
                 label_widget.pack(side=tk.LEFT)
-                
-                value_widget = ttk.Label(row_frame, text=value, 
-                                       font=(get_japanese_font(), 12))
+                value_widget = ttk.Label(row_frame, text=value, font=(get_japanese_font(), 12))
                 value_widget.pack(side=tk.RIGHT)
             
-            # Add the stats in the same order as the screenshot
             create_stat_row(stats_main_frame, "Total Time Played", f"{total_hours}h {total_minutes}m {total_seconds}s")
             create_stat_row(stats_main_frame, "Average Time Per Day", f"{avg_hours}h {avg_minutes}m {avg_seconds}s")
             create_stat_row(stats_main_frame, "Total Days Tracked", str(total_days))
@@ -1390,7 +1490,6 @@ class AudioMonitorApp:
             ttk.Label(overview_tab, text="No statistics available yet.\nStart using the app to generate some data!", 
                       font=(get_japanese_font(), 12), bootstyle="info").pack(pady=20, padx=10)
         
-        # --- Add Contribution Calendar Tab ---
         if MATPLOTLIB_AVAILABLE:
             calendar_tab = ttk.Frame(notebook, padding=10)
             notebook.add(calendar_tab, text="Contribution Calendar")
@@ -1401,8 +1500,6 @@ class AudioMonitorApp:
         notebook.select(daily_breakdown_tab)
         stats_window.wait_window()
 
-    # BUGFIX #4: Cleaned up the calendar creation logic.
-    # Removed unused/broken implementations and kept the working seaborn version.
     def _create_contribution_calendar_in_tab(self, parent_tab):
         """Creates and embeds a GitHub-style contribution calendar using seaborn."""
         has_data = any(isinstance(data, dict) and day != 'url_stats' for day, data in self.stats.items())
@@ -1414,19 +1511,15 @@ class AudioMonitorApp:
 
         try:
             def create_calendar_heatmap():
-                """Processes data and creates the heatmap plot."""
-                # 1. Load and prepare the raw data
                 data = {
                     date.fromisoformat(day): data.get('total_monitored_time', 0) / 3600.0
                     for day, data in self.stats.items()
                     if isinstance(data, dict) and day != 'url_stats'
                 }
-                if not data:
-                    return None
+                if not data: return None
                 all_days = pd.Series(data)
                 all_days.index = pd.to_datetime(all_days.index)
 
-                # 2. Create the correctly aligned date range
                 end_date = date.today()
                 start_date = end_date - timedelta(days=365)
                 start_date_aligned = start_date - timedelta(days=start_date.weekday())
@@ -1434,23 +1527,15 @@ class AudioMonitorApp:
                 date_range = pd.date_range(start=start_date_aligned, end=end_date_aligned)
                 all_days = all_days.reindex(date_range, fill_value=0)
 
-                # 3. Build and clean the DataFrame
                 all_days_df = pd.DataFrame({'date': all_days.index, 'hours': all_days.values})
                 all_days_df['hours'] = pd.to_numeric(all_days_df['hours'], errors='coerce').fillna(0)
                 all_days_df['weekday'] = all_days_df['date'].dt.weekday
                 all_days_df['unique_week'] = all_days_df['date'].dt.strftime('%Y-%W')
 
-                # 4. <<< THE DEFINITIVE FIX FOR THE BLACK LINE >>>
-                # Use the more robust `pivot_table` instead of `pivot`.
-                # The `fill_value=0` argument handles missing data correctly.
                 heatmap_data = all_days_df.pivot_table(
-                    index='weekday',
-                    columns='unique_week',
-                    values='hours',
-                    fill_value=0
+                    index='weekday', columns='unique_week', values='hours', fill_value=0
                 )
 
-                # --- Plotting Code ---
                 bg_color = self.root.style.colors.bg
                 fg_color = self.root.style.colors.fg
 
@@ -1458,7 +1543,6 @@ class AudioMonitorApp:
                 fig.patch.set_facecolor(bg_color)
                 ax.set_facecolor(bg_color)
 
-                # 5. <<< RESTORE THE GRID LINES >>>
                 sns.heatmap(heatmap_data, ax=ax, cmap="Greens", cbar=True, linewidths=.5, linecolor=bg_color,
                             cbar_kws={'label': 'Hours Played', 'orientation': 'vertical'})
 
@@ -1467,10 +1551,7 @@ class AudioMonitorApp:
                 ax.set_xlabel('')
                 ax.set_yticklabels(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'], rotation=0, color=fg_color)
 
-                # 6. Create the month labels
-                month_ticks = []
-                month_labels = []
-                last_month = -1
+                month_ticks = []; month_labels = []; last_month = -1
                 for i, week_str in enumerate(heatmap_data.columns):
                     try:
                         first_day_of_week = pd.to_datetime(week_str + '-1', format='%Y-%W-%w')
@@ -1479,8 +1560,7 @@ class AudioMonitorApp:
                             month_ticks.append(i + 0.5)
                             month_labels.append(first_day_of_week.strftime("%b '%y"))
                             last_month = current_month
-                    except (ValueError, IndexError):
-                        continue
+                    except (ValueError, IndexError): continue
                 
                 ax.set_xticks(month_ticks)
                 ax.set_xticklabels(month_labels, rotation=30, ha='right', color=fg_color, fontsize=9)
@@ -1611,7 +1691,7 @@ class AudioMonitorApp:
                 self.url_tree.insert("", tk.END, values=(title, url, url_type))
                 self.all_tree_items.append({'title': title, 'url': url, 'type': url_type})
             
-            self.update_playlist_ui() # Update count and title
+            self.update_playlist_ui()
             self.log(f"Playlist loaded successfully from {os.path.basename(file_path)}", "green")
         except Exception as e:
             self.log(f"Error loading playlist: {e}", "red")
@@ -1651,7 +1731,6 @@ class AudioMonitorApp:
             try: self.control_video_playback("pause")
             except WebDriverException: pass 
         time.sleep(0.5)
-        # ✅ FEATURE: Persistent Browser Window - Save geometry before stopping
         self.update_player_geometries()
         self.is_monitoring = False
         self.log("Stopping playback...", 'blue')
@@ -1663,8 +1742,7 @@ class AudioMonitorApp:
         self.update_countdown_display(-1)
         self.update_window_title()
 
-        # --- NEW: Hide Now Playing card ---
-        self.now_playing_frame.pack_forget()
+        # Hide Now Playing card
         self.now_playing_title_var.set("Nothing Playing")
         self.now_playing_progress_var.set(0)
         self.set_placeholder_thumbnail()
@@ -1707,18 +1785,15 @@ class AudioMonitorApp:
 
                             self.audio_level = max(self.audio_level * 0.8, volume_norm * 50)
                             
-                            # ENHANCED: Store audio data for visualization
                             if self.visualization_mode_var.get() in ["waveform", "spectrum"]:
                                 mono_data = np.mean(indata, axis=1) if len(indata.shape) > 1 else indata.flatten()
                                 self.audio_buffer.extend(mono_data * self.audio_gain_var.get())
                             
-                            # FIX: Update debounce timers instead of calling UI directly
                             if volume_norm < self.silence_threshold_var.get():
                                 self.last_silence_time = time.time()
                             else:
                                 self.last_sound_time = time.time()
 
-                            # --- MODIFIED: Universal Silence Detection Logic ---
                             silence_threshold_seconds = self.silence_minutes_var.get() * 60
 
                             if volume_norm < self.silence_threshold_var.get():
@@ -1728,36 +1803,31 @@ class AudioMonitorApp:
                                     elapsed_silence = time.time() - self.silence_start_time
                                     remaining_time = silence_threshold_seconds - elapsed_silence
 
-                                    # Update countdown display regardless of monitoring state
                                     if time.time() - self.last_countdown_update > 0.5:
                                         self.root.after(0, self.update_countdown_display, remaining_time)
                                         self.last_countdown_update = time.time()
 
                                     if remaining_time <= 0:
                                         self.root.after(0, self.update_countdown_display, -1)
-                                        # Check for AFK first
                                         if self.afk_enabled_var.get() and self.is_afk:
                                             self.log("AFK detected, will not start/advance on silence.", "orange")
-                                            self.silence_start_time = time.time() # Reset timer to wait again
+                                            self.silence_start_time = time.time()
                                         else:
-                                            # If already monitoring, advance the video
                                             if self.is_monitoring and not self.is_paused:
                                                 minutes = self.silence_minutes_var.get()
                                                 self.log(f"Silence detected for over {minutes} min. Advancing video.", 'green')
                                                 self.root.after(0, self.handle_silence_trigger)
-                                            # If idle, start a new playback session
                                             elif not self.is_monitoring:
                                                 minutes = self.silence_minutes_var.get()
                                                 self.log(f"Silence detected for over {minutes} min. Starting playback.", 'green')
                                                 self.root.after(0, self.start_monitoring_with_resume)
                                             
-                                            self.silence_start_time = None # Reset after triggering
-                            else: # Sound is detected
+                                            self.silence_start_time = None 
+                            else: 
                                 if self.silence_start_time is not None:
                                     self.root.after(0, self.update_countdown_display, -1)
                                 self.silence_start_time = None
 
-                            # --- Logic that ONLY runs when actively monitoring ---
                             if self.is_monitoring and not self.is_paused:
                                 if not self.monitored_time_started and volume_norm > self.sound_threshold_var.get():
                                     self.monitoring_start_time = time.time()
@@ -1787,8 +1857,7 @@ class AudioMonitorApp:
             self.pre_afk_status_text = text
 
     def start_afk_detector(self):
-        """Starts a background thread to monitor for user inactivity (AFK)
-           using the best method for the current OS."""
+        """Starts a background thread to monitor for user inactivity (AFK)"""
 
         def afk_thread_func():
             was_afk = False
@@ -1808,9 +1877,7 @@ class AudioMonitorApp:
                                 self.is_afk = idle_time_sec > (self.afk_timeout_minutes_var.get() * 60)
                         else: self.is_afk = False
                         
-                        # MODIFIED BEHAVIOR STARTS HERE
                         if self.is_afk and not was_afk:
-                            # If a video is playing, pause it.
                             if self.is_monitoring and not self.is_paused:
                                 self.log("User is now AFK. Pausing playback.", "orange")
                                 self.root.after(0, self.pause_monitoring)
@@ -1822,12 +1889,11 @@ class AudioMonitorApp:
                                 self.root.after(0, self.set_status, "Status: AFK (Playback Paused)")
                             self.root.after(0, self.update_tray_icon_state)
                             was_afk = True
-                        # MODIFIED BEHAVIOR ENDS HERE
 
                         elif not self.is_afk and was_afk:
                             self.log("User activity detected. Resuming normal operation.", "green")
                             if self.show_afk_status_var.get(): self.root.after(0, self.set_status, self.pre_afk_status_text)
-                            self.root.after(0, self.update_tray_icon_state) # NEW
+                            self.root.after(0, self.update_tray_icon_state)
                             was_afk = False
                     except Exception as e: self.log(f"Error in Windows AFK detector: {e}", "red")
                     time.sleep(5)
@@ -1843,9 +1909,7 @@ class AudioMonitorApp:
                         if self.afk_enabled_var.get(): self.is_afk = (time.time() - self.last_input_time) > (self.afk_timeout_minutes_var.get() * 60)
                         else: self.is_afk = False
 
-                        # MODIFIED BEHAVIOR STARTS HERE
                         if self.is_afk and not was_afk:
-                            # If a video is playing, pause it.
                             if self.is_monitoring and not self.is_paused:
                                 self.log("User is now AFK. Pausing playback.", "orange")
                                 self.root.after(0, self.pause_monitoring)
@@ -1857,7 +1921,6 @@ class AudioMonitorApp:
                                 self.root.after(0, self.set_status, "Status: AFK (Playback Paused)")
                             self.root.after(0, self.update_tray_icon_state)
                             was_afk = True
-                        # MODIFIED BEHAVIOR ENDS HERE
 
                         elif not self.is_afk and was_afk:
                             self.log("User activity detected. Resuming normal operation.", "green")
@@ -1905,7 +1968,6 @@ class AudioMonitorApp:
 
     def update_sound_bar(self):
         """Update simple bar visualization."""
-        # FIX: Ensure this loop only runs when the bar is active and exists
         if self.visualization_mode_var.get() != "bar" or not self.sound_bar_canvas or not self.sound_bar_canvas.winfo_exists():
             return
             
@@ -1939,6 +2001,12 @@ class AudioMonitorApp:
         file_path = filedialog.askopenfilename(title="Select MPV Executable", filetypes=filetypes)
         if file_path: self.mpv_path_var.set(file_path)
 
+    def browse_folder_path(self, string_var):
+        """Opens a dialog to select a folder and sets the provided StringVar."""
+        folder_path = filedialog.askdirectory(title="Select Folder")
+        if folder_path:
+            string_var.set(folder_path)    
+
     def add_url_to_list(self, url):
         if 'playlist' in url.lower():
             self.expand_playlists_var.set(True)
@@ -1951,26 +2019,18 @@ class AudioMonitorApp:
             self.log(f"Added local file/folder: {title}", "green")
         else:
             if self.fetch_titles_var.get():
-                # Insert with "Fetching Title..." and get the item_id
                 item_id = self.url_tree.insert("", tk.END, values=("Fetching Title...", url, url_type))
-                
-                # Store in internal data with the ID
                 item_data = {'title': "Fetching Title...", 'url': url, 'type': url_type, 'id': item_id}
                 self.all_tree_items.append(item_data)
-                
                 self.log(f"Added URL for title fetching: {url} (item_id: {item_id})", "cyan")
-                
-                # Start the title fetching thread
                 threading.Thread(target=self._fetch_single_web_title, args=(url, item_id), daemon=True).start()
             else:
-                # Not fetching titles, just use the URL as the title
                 item_id = self.url_tree.insert("", tk.END, values=(url, url, url_type))
                 self.all_tree_items.append({'title': url, 'url': url, 'type': url_type, 'id': item_id})
                 self.log(f"Added URL without title fetching: {url}", "green")
         
         self.update_playlist_ui()
 
-    # BUGFIX #1: Fetches title using fast API calls instead of slow Selenium.
     def _fetch_single_web_title(self, url, item_id):
         """Fetches a video title using fast, direct API calls."""
         title = "Title Unavailable"
@@ -1999,7 +2059,6 @@ class AudioMonitorApp:
                 self.log(f"Unknown URL type, cannot fetch title for: {url}", "orange")
                 title = "Unknown URL Type"
 
-            # Clean up common suffixes
             for site_name in ['-哔哩哔哩', '_bilibili', '| bilibili', ' - YouTube']:
                 if title.lower().endswith(site_name.lower()):
                     title = title[:-len(site_name)]
@@ -2026,7 +2085,6 @@ class AudioMonitorApp:
         try:
             self.log(f"Attempting to update treeview item {item_id} with title: '{new_title}'", "cyan")
             
-            # Find the item in our internal data by its original ID
             target_item_data = next((item for item in self.all_tree_items if item.get('id') == item_id), None)
             
             if target_item_data:
@@ -2037,19 +2095,15 @@ class AudioMonitorApp:
                 self.log(f"Could not find item {item_id} in internal data. It may have been removed.", "orange")
                 return
 
-            # Now, find the item in the *current* treeview by its URL and update it.
-            # This is necessary because the treeview might have been rebuilt, invalidating the original item_id.
             for tree_item_id in self.url_tree.get_children():
                 try:
                     values = self.url_tree.item(tree_item_id, 'values')
                     if len(values) >= 2 and values[1] == target_url:
-                        # Found it! Update the title.
                         new_values = (new_title, values[1], values[2] if len(values) > 2 else 'Video')
                         self.url_tree.item(tree_item_id, values=new_values)
                         self.log(f"Found and updated treeview item by URL: {target_url}", "green")
                         return
                 except tk.TclError:
-                    # Item might have been deleted between get_children and item()
                     continue
             
             self.log(f"Could not find a visible treeview item with URL to update: {target_url}", "orange")
@@ -2138,7 +2192,6 @@ class AudioMonitorApp:
                 
                 videos = []
                 try:
-                    # MODIFIED: Use a temporary headless browser for playlist expansion.
                     self.log("Using a temporary headless browser for playlist expansion...", "cyan")
                     status_label.config(text="Launching temporary browser...")
                     progress_dialog.update()
@@ -2194,8 +2247,6 @@ class AudioMonitorApp:
                     self.set_button_states('monitoring')
                     self.update_playlist_info()
                     
-                    # self.browser is NOT expected to be ready here.
-                    # load_video() will create it on demand with the correct (non-headless) settings.
                     self.log(f"Loading first video: {self.get_display_name(self.current_url, format_type='log')}", "green")
                     self.load_video(self.current_url)
                     
@@ -2227,14 +2278,14 @@ class AudioMonitorApp:
             
             if 'youtube.com' in playlist_url:
                 if progress_callback: progress_callback("Loading YouTube playlist...", "")
-                time.sleep(2) # Initial wait for page to render
+                time.sleep(2)
                 
                 self.log("Starting YouTube scroll loop to load all videos...", "cyan")
                 last_height = browser.execute_script("return document.documentElement.scrollHeight")
                 scroll_attempts = 0
-                while scroll_attempts < 15: # Safety break after 15 scrolls
+                while scroll_attempts < 15:
                     browser.execute_script("window.scrollTo(0, document.documentElement.scrollHeight);")
-                    time.sleep(2.5) # Wait for new videos to load
+                    time.sleep(2.5)
                     new_height = browser.execute_script("return document.documentElement.scrollHeight")
                     if new_height == last_height:
                         self.log("Scrolling complete, page height is stable.", "green")
@@ -2284,8 +2335,6 @@ class AudioMonitorApp:
 
                 video_urls_set = set()
                 
-                # --- START: NEW ROBUST JAVASCRIPT ---
-                # This script looks for a wider, more reliable range of selectors.
                 js_script = """
                 function getBilibiliLinksInOrder() {
                     const videoItems = document.querySelectorAll(
@@ -2306,7 +2355,6 @@ class AudioMonitorApp:
                 }
                 return getBilibiliLinksInOrder();
                 """
-                # --- END: NEW ROBUST JAVASCRIPT ---
 
                 for page_num in range(1, 51):
                     self.log(f"Scraping Bilibili playlist page {page_num}...", "cyan")
@@ -2325,7 +2373,6 @@ class AudioMonitorApp:
                                 new_videos_found_this_page.append(video_url)
                                 video_urls_set.add(video_url)
                         
-                        # Only log if we actually found new videos on this page turn
                         if new_videos_found_this_page:
                            self.log(f"Found {len(new_videos_found_this_page)} new videos on this page.", "blue")
                            video_urls.extend(new_videos_found_this_page)
@@ -2459,12 +2506,12 @@ class AudioMonitorApp:
             if (video) {
                 return video.paused;
             }
-            return null; // Return null if no video element is found
+            return null;
             """
             is_paused = self.browser.execute_script(js_script)
             return is_paused
         except (WebDriverException, JavascriptException, TypeError):
-            return None # Return None on any exception
+            return None
 
     def simple_monitor_loop(self):
         try:
@@ -2549,12 +2596,11 @@ class AudioMonitorApp:
 
         def start_monitor_thread():
             self.start_monitoring(from_beginning)
-            # FIX: Wait for the setup process in monitor_loop to complete
-            self.setup_complete_event.wait(timeout=30) # Wait up to 30s
+            self.setup_complete_event.wait(timeout=30)
             try:
                 progress_dialog.destroy()
             except tk.TclError:
-                pass # Window was already closed
+                pass 
         
         threading.Thread(target=start_monitor_thread, daemon=True).start()
 
@@ -2562,18 +2608,15 @@ class AudioMonitorApp:
         """A centralized function to manage the state of all interactive UI elements."""
         if state == 'monitoring':
             self.start_btn.config(state='disabled')
-            self.start_fresh_btn.config(state='disabled')
             self.pause_btn.config(state='normal', text="⏸️ PAUSE", command=self.pause_monitoring, bootstyle="warning")
             self.stop_btn.config(state='normal')
             self.now_playing_play_pause_btn.config(text="⏸️")
             self.set_status("Status: ▶️ Playing")
-            # Disable playlist modification during playback
             for btn in [self.add_url_btn, self.add_folder_btn, self.browse_file_btn, self.remove_url_btn, self.save_playlist_btn, self.load_playlist_btn]:
                 btn.config(state='disabled')
 
         elif state == 'paused':
             self.start_btn.config(state='disabled')
-            self.start_fresh_btn.config(state='disabled')
             self.pause_btn.config(state='normal', text="▶️ RESUME", command=self.resume_monitoring, bootstyle="success")
             self.stop_btn.config(state='normal')
             self.now_playing_play_pause_btn.config(text="▶️")
@@ -2583,20 +2626,17 @@ class AudioMonitorApp:
 
         elif state == 'idle':
             self.start_btn.config(state='normal')
-            self.start_fresh_btn.config(state='normal')
             self.pause_btn.config(state='disabled', text="⏸️ PAUSE", command=self.pause_monitoring, bootstyle="warning")
             self.stop_btn.config(state='disabled')
             self.now_playing_play_pause_btn.config(text="▶️")
-            self.set_status("Status: 👂 Listening")
-            # Enable playlist modification when idle
+            self.set_status("Status: 🎧 Listening")
             for btn in [self.add_url_btn, self.add_folder_btn, self.browse_file_btn, self.remove_url_btn, self.save_playlist_btn, self.load_playlist_btn]:
                 btn.config(state='normal')
 
         elif state == 'fetching':
             self.start_btn.config(state='disabled')
-            self.start_fresh_btn.config(state='disabled')
             self.pause_btn.config(state='disabled')
-            self.stop_btn.config(state='normal') # Allow stopping during fetch
+            self.stop_btn.config(state='normal')
             self.set_status("Status: Fetching...")
             for btn in [self.add_url_btn, self.add_folder_btn, self.browse_file_btn, self.remove_url_btn, self.save_playlist_btn, self.load_playlist_btn]:
                 btn.config(state='disabled')
@@ -2619,9 +2659,8 @@ class AudioMonitorApp:
             self.update_timer()
 
     def on_closing(self):
-        # ✅ FEATURE: Persistent Browser Window - Save geometry on close
         if self.is_monitoring: self.save_current_timestamp(); self.save_stats()
-        self.save_profile() # Save settings on close
+        self.save_profile()
         if self.browser:
             try: self.browser.quit(); self.log("Browser closed on exit.", "blue")
             except Exception as e: self.log(f"Error closing browser on exit: {e}", "red")
@@ -2632,23 +2671,20 @@ class AudioMonitorApp:
         
     def start_monitoring(self, from_beginning=False):
         """
-        FIXED: This function now correctly initiates the entire playback process.
+        Initiates the entire playback process.
         """
-        # Ensure there's something to play
         initial_urls = [item['url'] for item in self.get_items_from_display()]
         if not initial_urls:
             messagebox.showerror("Error", "Please add at least one URL or file to the list.")
             self.log("Start failed: No URLs provided.", 'red')
-            self.setup_complete_event.set() # Allow dialog to close
+            self.setup_complete_event.set()
             return
 
-        # Handle playback from beginning
         if from_beginning:
             self.ignore_timestamps_for_session = True
             self.log("Starting from the beginning, ignoring saved timestamps for this session.", "blue")
         else:
             self.ignore_timestamps_for_session = False
-            # Check if all videos have been watched
             playable_videos = [url for url in initial_urls if self.get_saved_timestamp_status(url) != "finished"]
             if not playable_videos and not any(self.get_url_type(url) == "Playlist" for url in initial_urls):
                  messagebox.showinfo("All Watched", "All items have been watched. Use 'Play from Beginning' to watch again.")
@@ -2657,16 +2693,14 @@ class AudioMonitorApp:
                  self.set_button_states('idle')
                  return
 
-        # Set the application state to "monitoring"
         self.is_monitoring = True
         self.is_paused = False
-        self.now_playing_frame.pack(fill=tk.X, padx=10, pady=10, before=self.left_frame)
+        # REFACTOR: Pack the Now Playing card into the dashboard
         self.update_now_playing_card()
         self.monitoring_start_time = None
         self.monitoring_paused_time = 0
         self.setup_complete_event.clear()
 
-        # Start the main monitor_loop in a new thread
         self.monitor_thread = threading.Thread(
             target=self.monitor_loop, 
             args=(initial_urls,), 
@@ -2676,10 +2710,8 @@ class AudioMonitorApp:
 
     def monitor_loop(self, urls_to_monitor):
         try:
-            # --- START: MODIFIED Playlist Handling ---
             self.log("Monitor loop started. Preparing playlist...", "cyan")
             
-            # If "Expand All Playlists" is checked, use a temporary headless browser to scrape everything first.
             if self.expand_playlists_var.get() and any(self.get_url_type(url) == "Playlist" for url in urls_to_monitor):
                 self.log("Expanding all playlists in a temporary headless browser...", "blue")
                 try:
@@ -2694,9 +2726,7 @@ class AudioMonitorApp:
                     self.setup_complete_event.set()
                     return
             else:
-                 # Default behavior: only expand the first item if it's a playlist (now also done headlessly).
                  urls_to_monitor = self.always_expand_playlists(urls_to_monitor)
-            # --- END: MODIFIED Playlist Handling ---
 
             if self.true_random_on_skip_var.get():
                 self.true_random_monitor_loop(urls_to_monitor)
@@ -2704,7 +2734,7 @@ class AudioMonitorApp:
 
             self.main_queue = list(urls_to_monitor)
             self.main_queue_index = 0
-            self.current_playlist_videos = [] # Reset playlist-specific variables
+            self.current_playlist_videos = []
 
             if self.smart_shuffle_var.get():
                 watched = [url for url in self.main_queue if self.get_saved_timestamp_status(url) == "finished"]
@@ -2718,18 +2748,16 @@ class AudioMonitorApp:
 
             has_web_urls = any(not self.is_local_file(url) for url in self.main_queue)
             if has_web_urls and not self.browser:
-                # This will now create the VISIBLE browser for playback.
                 self.setup_browser()
                 if not self.browser:
                     self.log("Browser setup failed. Stopping playback.", "red")
                     self.root.after(0, self.stop_monitoring)
-                    self.setup_complete_event.set() # FIX: Signal completion on failure
+                    self.setup_complete_event.set()
                     return
 
             self.root.after(0, self.set_button_states, 'monitoring')
-            self.setup_complete_event.set() # FIX: Signal that setup is complete
+            self.setup_complete_event.set()
 
-            # Main playback loop
             while self.is_monitoring and self.main_queue_index < len(self.main_queue):
                 current_item = self.main_queue[self.main_queue_index]
                 self.current_url = current_item
@@ -2737,7 +2765,6 @@ class AudioMonitorApp:
                 
                 url_type = self.get_url_type(current_item)
 
-                # Sequentially handle playlists if they weren't pre-expanded
                 if url_type == "Playlist" and self.sequential_playlists_var.get() and not self.treat_playlists_as_videos_var.get():
                     self.handle_playlist_sequential(current_item)
                 else: 
@@ -2750,7 +2777,7 @@ class AudioMonitorApp:
 
                 self.main_queue_index += 1
                 if self.main_queue_index < len(self.main_queue):
-                    time.sleep(1) # Brief pause between videos/playlists
+                    time.sleep(1)
 
             self.log("Finished all items in the queue.", "green")
 
@@ -2773,7 +2800,7 @@ class AudioMonitorApp:
             messagebox.showerror("Error", f"Could not expand playlists for random mode.\n\n{e}")
             return
         finally:
-            self.setup_complete_event.set() # Also signal here
+            self.setup_complete_event.set()
 
         if not self.expanded_video_pool:
             self.log("No videos found after expanding playlists. Stopping.", "red")
@@ -2809,15 +2836,12 @@ class AudioMonitorApp:
             if profile_name: options.add_argument(f"--profile-directory={profile_name}")
             if not self.unmute_var.get(): options.add_argument("--mute-audio")
 
-            # ✅ FIX: Force patcher to close old processes and ensure compatibility.
-            # Manually set your Chrome version number here (e.g., 139)
             self.log("Patching and creating uc.Chrome instance...");
             self.browser = uc.Chrome(options=options, patcher_force_close=True)
             self.log("Browser instance created successfully.", "green")
             
             if not self.headless_var.get():
                 try:
-                    # ✅ FEATURE: Persistent Browser Window - Apply saved geometry
                     browser_geom_str = self.browser_geometry_var.get()
                     if browser_geom_str:
                         browser_geom = json.loads(browser_geom_str)
@@ -2834,7 +2858,6 @@ class AudioMonitorApp:
         
         self.update_window_title()
         
-        # ENHANCED: Update Now Playing Card with actual title
         title = self.get_video_title(url)
         self.now_playing_title_var.set(title)
         self.now_playing_progress_var.set(0)
@@ -2898,7 +2921,7 @@ class AudioMonitorApp:
                                 self.update_window_title()
                                 title = self.get_video_title(url)
                                 self.now_playing_title_var.set(title)
-                                self.update_tray_menu() # FIX: Refresh tray with new title
+                                self.update_tray_menu()
                             else:
                                 if 'youtube.com' in url:
                                     title_element = self.browser.execute_script(
@@ -2908,7 +2931,7 @@ class AudioMonitorApp:
                                         self.url_to_title_map[url] = title_element.strip()
                                         self.update_window_title()
                                         self.now_playing_title_var.set(title_element.strip())
-                                        self.update_tray_menu() # FIX: Refresh tray with new title
+                                        self.update_tray_menu()
                         except Exception as e:
                             print(f"DEBUG: Error getting title after page load: {e}")
                     
@@ -3073,6 +3096,7 @@ class AudioMonitorApp:
         profile = self.config_data.get("profiles", {}).get(profile_name, {})
         
         self.theme_var.set(profile.get('theme', 'litera'))
+        self.playlist_mode_var.set(profile.get('playlist_mode', 'Custom'))
         for var_name, default in [
             ('headless', True), ('autostart', False), ('random_list', False), 
             ('save_timestamp', True), ('unmute', False), ('auto_skip', True), 
@@ -3102,7 +3126,6 @@ class AudioMonitorApp:
     def save_profile(self):
         profile_name = self.active_profile_name.get()
         if not profile_name:
-            # Don't show an error if it's just a general save, just use default
             profile_name = "Default"
             self.active_profile_name.set(profile_name)
 
@@ -3115,14 +3138,12 @@ class AudioMonitorApp:
             'profile_name', 'mpv_path', 'recursive_folder', 'fetch_titles', 
             'audio_device', 'afk_enabled', 'afk_timeout_minutes', 'show_afk_status', 
             'treat_playlists_as_videos', 'finished_percentage', 'true_random_on_skip',
-            'sequential_playlists', 'theme', 'smart_shuffle'
+            'sequential_playlists', 'theme', 'smart_shuffle', 'playlist_mode'
         ]:
             current_profile_data[var_name] = getattr(self, f"{var_name}_var").get()
         
         current_profile_data['app_geometry'] = self.root.geometry()
         
-        # --- START BUG FIX ---
-        # This is the key change: Directly get the browser geometry when saving.
         if self.browser and self.is_browser_responsive():
             try:
                 pos = self.browser.get_window_position()
@@ -3137,7 +3158,6 @@ class AudioMonitorApp:
                 current_profile_data['browser_geometry'] = json.loads(self.browser_geometry_var.get())
              except (json.JSONDecodeError, TypeError):
                 current_profile_data['browser_geometry'] = {}
-        # --- END BUG FIX ---
         
         current_profile_data['stats_window_geometry'] = getattr(self, 'stats_window_geometry', '')
 
@@ -3288,16 +3308,13 @@ class AudioMonitorApp:
 
     def update_playlist_ui(self):
         """Updates the playlist UI elements like title and count."""
-        # Update treeview from the master list
         self.url_tree.delete(*self.url_tree.get_children())
         for item in self.all_tree_items:
             self.url_tree.insert("", tk.END, values=(item.get('title'), item.get('url'), item.get('type')))
         
-        # Update the Labelframe title with the count
         count = len(self.all_tree_items)
         self.url_frame.config(text=f"Playlist ({count} items) 📝")
         
-        # Update the main window title
         self.update_window_title()
 
     def is_local_file(self, path): return os.path.isfile(path) and not path.startswith(('http://', 'https://'))
@@ -3388,7 +3405,6 @@ class AudioMonitorApp:
                 self.browser.execute_script(f"document.querySelector('video').currentTime = {timestamp};")
             except: pass
 
-    # ✅ FEATURE: Persistent Browser Window - This method saves the current browser geometry.
     def update_player_geometries(self):
         """Saves the current geometry of the browser window if it's open."""
         if self.browser and not self.headless_var.get():
@@ -3398,7 +3414,6 @@ class AudioMonitorApp:
                 browser_geom = {'x': pos['x'], 'y': pos['y'], 'width': size['width'], 'height': size['height']}
                 self.browser_geometry_var.set(json.dumps(browser_geom))
             except WebDriverException:
-                # This can happen if the browser is closed manually
                 self.log("Could not save browser geometry, it may have been closed.", "orange")
 
     def preprocess_playlists(self, url_list, browser):
@@ -3458,13 +3473,11 @@ class AudioMonitorApp:
             
             self.root.after(0, self.update_playlist_info)
             self.load_video(video_url)
-            self.root.after(0, self.update_timer) # Ensure timer is running
+            self.root.after(0, self.update_timer)
             
-            self.skip_event.clear()  # Reset the skip flag for this new video
+            self.skip_event.clear()
             
-            # BUGFIX #2: Replace time.sleep with a more responsive event wait.
             while self.is_monitoring:
-                # Check for browser/mpv closure first
                 if self.browser and not self.is_browser_responsive():
                     self.log("Browser closed. Stopping video handler.", "orange")
                     break
@@ -3473,10 +3486,9 @@ class AudioMonitorApp:
                     break
 
                 if self.is_paused:
-                    time.sleep(0.5) # Still sleep when paused
+                    time.sleep(0.5)
                     continue
 
-                # Check for sync events
                 is_player_paused = self.get_player_paused_state()
                 if self.sync_video_pause_var.get():
                     if is_player_paused and not self.is_paused:
@@ -3484,14 +3496,12 @@ class AudioMonitorApp:
                     elif not is_player_paused and self.is_paused:
                         self.root.after(0, self.resume_monitoring, True)
 
-                # Check for auto-skip
                 if self.auto_skip_var.get() and self.is_video_ended():
                     self.log("Video ended", "blue")
                     self.update_stats(0, skipped=True)
                     self.save_current_timestamp()
-                    break # Exit the loop to advance to the next video
+                    break
 
-                # Update stats periodically
                 if time.time() - self.last_stats_update_time > 10:
                     elapsed = time.time() - self.last_stats_update_time
                     self.update_stats(elapsed)
@@ -3499,12 +3509,9 @@ class AudioMonitorApp:
                     self.last_stats_update_time = time.time()
                     self.save_stats()
 
-                # The core of the fix: wait on the event with a timeout.
-                # This makes the loop "sleep" for up to 1 second, but if the
-                # skip_event is set (e.g., by the "Next" button), it wakes up immediately.
                 if self.skip_event.wait(timeout=1.0):
                     self.log("Skip event detected, exiting video loop.", "blue")
-                    break # Exit the loop because the event was set
+                    break
 
             self.save_current_timestamp()
             
@@ -3519,15 +3526,12 @@ class AudioMonitorApp:
         try:
             self.log(f"Expanding playlist: {playlist_url}", "blue")
 
-            # --- START: MODIFIED SECTION ---
-            # FIX: Reuse the main browser for scraping to avoid connection errors.
             if not self.is_browser_responsive():
                 self.log("Browser is not responsive, cannot expand playlist.", "red")
-                return # The main loop will detect the browser issue and stop.
+                return
 
             self.log(f"Using main browser instance to scrape playlist...", "cyan")
             videos = self.get_playlist_videos(self.browser, playlist_url)
-            # --- END: MODIFIED SECTION ---
 
             if not videos or (len(videos) == 1 and videos[0] == playlist_url):
                 self.log(f"Could not expand playlist, playing as single item", "orange")
@@ -3541,7 +3545,7 @@ class AudioMonitorApp:
             self.current_playlist_videos = videos
             self.current_playlist_index = 0
             self.current_item_type = 'playlist'
-            self.playlist_exhausted = False  # Add flag to track if we should exit playlist
+            self.playlist_exhausted = False
             
             while self.current_playlist_index < len(self.current_playlist_videos) and self.is_monitoring and not self.playlist_exhausted:
                 video_url = self.current_playlist_videos[self.current_playlist_index]
@@ -3559,12 +3563,9 @@ class AudioMonitorApp:
                 
                 self.handle_single_video(video_url)
                 
-                # Check if we should stay in the playlist or exit
                 if not hasattr(self, 'skip_to_next_in_playlist') or not self.skip_to_next_in_playlist:
-                    # Normal progression or playlist ended
                     self.current_playlist_index += 1
                 else:
-                    # We're skipping within playlist, increment and continue
                     self.current_playlist_index += 1
                     self.skip_to_next_in_playlist = False
                 
@@ -3590,7 +3591,6 @@ class AudioMonitorApp:
         url_type = self.get_url_type(url)
         type_emoji = {"Video": "🎬", "Playlist": "📃", "Local File": "💾", "Folder": "📂"}.get(url_type, "📄")
 
-        # Get the actual title using the new method
         title = self.get_video_title(url)
             
         if format_type == 'log': 
@@ -3606,7 +3606,7 @@ class AudioMonitorApp:
 
         self.nav_frame.pack(fill=tk.X, pady=5)
 
-        # Show playlist progress if current playlist videos exist
+        # Case 1: We are inside a sequential playlist
         if self.current_playlist_videos and len(self.current_playlist_videos) > 1:
             current_title = self.get_display_name(self.current_url)
             if len(current_title) > 40:
@@ -3614,95 +3614,113 @@ class AudioMonitorApp:
             info = f"Playlist: {self.current_playlist_index + 1} / {len(self.current_playlist_videos)} - {current_title}"
             self.playlist_info_label.config(text=info)
 
-            self.prev_btn.config(
-                state=tk.NORMAL if self.current_playlist_index > 0 else tk.DISABLED,
-                bootstyle="primary" if self.current_playlist_index > 0 else "primary-outline"
-            )
-            self.next_btn.config(
-                state=tk.NORMAL if self.current_playlist_index < len(self.current_playlist_videos) - 1 else tk.DISABLED,
-                bootstyle="primary" if self.current_playlist_index < len(self.current_playlist_videos) - 1 else "primary-outline"
-            )
+            self.prev_btn.config(state=tk.NORMAL if self.current_playlist_index > 0 else tk.DISABLED)
+            self.next_btn.config(state=tk.NORMAL if self.current_playlist_index < len(self.current_playlist_videos) - 1 else tk.DISABLED)
 
             self.jump_entry_var.set(str(self.current_playlist_index + 1))
+            self.total_videos_label.config(text=str(len(self.current_playlist_videos)))
             self.current_video_title_var.set(current_title)
-            self.update_video_title_display()
-        else:
-            # Regular queue mode
-            if hasattr(self, 'main_queue') and self.main_queue:
-                current_title = self.get_display_name(self.current_url)
-                if len(current_title) > 40:
-                    current_title = current_title[:37] + "..."
-                info = f"Queue: {self.main_queue_index + 1} / {len(self.main_queue)} - {current_title}"
-                self.playlist_info_label.config(text=info)
 
-                self.prev_btn.config(
-                    state=tk.NORMAL if self.main_queue_index > 0 else tk.DISABLED,
-                    bootstyle="primary" if self.main_queue_index > 0 else "primary-outline"
-                )
-                self.next_btn.config(
-                    state=tk.NORMAL if self.main_queue_index < len(self.main_queue) - 1 else tk.DISABLED,
-                    bootstyle="primary" if self.main_queue_index < len(self.main_queue) - 1 else "primary-outline"
-                )
-            else:
-                self.playlist_info_label.config(text=f"Now Playing: {self.get_display_name(self.current_url)}")
-                self.prev_btn.config(state=tk.DISABLED, bootstyle="primary-outline")
-                self.next_btn.config(state=tk.DISABLED, bootstyle="primary-outline")
+        # Case 2: We are in the main queue
+        elif hasattr(self, 'main_queue') and self.main_queue:
+            current_title = self.get_display_name(self.current_url)
+            if len(current_title) > 40:
+                current_title = current_title[:37] + "..."
+            info = f"Queue: {self.main_queue_index + 1} / {len(self.main_queue)} - {current_title}"
+            self.playlist_info_label.config(text=info)
+
+            self.prev_btn.config(state=tk.NORMAL if self.main_queue_index > 0 else tk.DISABLED)
+            self.next_btn.config(state=tk.NORMAL if self.main_queue_index < len(self.main_queue) - 1 else tk.DISABLED)
+            
+            self.jump_entry_var.set(str(self.main_queue_index + 1)) # <-- This line was missing
+            self.total_videos_label.config(text=str(len(self.main_queue)))
+            self.current_video_title_var.set("")
+
+        # Case 3: A single video is playing directly (not in a queue)
+        else:
+            self.playlist_info_label.config(text=f"Now Playing: {self.get_display_name(self.current_url)}")
+            self.prev_btn.config(state=tk.DISABLED)
+            self.next_btn.config(state=tk.DISABLED)
+            self.jump_entry_var.set("1")
+            self.total_videos_label.config(text="1")
             self.current_video_title_var.set("")
 
         self.update_tray_menu()
     
     def skip_videos(self, count):
-        if not self.is_monitoring or not self.current_playlist_videos:
+        """Skips forward or backward in the current queue (playlist or main)."""
+        if not self.is_monitoring:
             return
         
-        new_index = self.current_playlist_index + count
-        
-        new_index = max(0, min(new_index, len(self.current_playlist_videos) - 1))
-        
-        if new_index != self.current_playlist_index:
-            self.current_playlist_index = new_index - 1  # Subtract 1 because loop will increment
-            self.current_url = self.current_playlist_videos[new_index]  # Update current URL
-            # Set the skip event to interrupt the current video's loop
-            self.skip_event.set()
-            self.log(f"Jumping to video {new_index + 1}/{len(self.current_playlist_videos)}", "blue")
+        # Case 1: We are inside a sequential playlist
+        if self.current_playlist_videos:
+            new_index = self.current_playlist_index + count
+            new_index = max(0, min(new_index, len(self.current_playlist_videos) - 1))
+            
+            if new_index != self.current_playlist_index:
+                self.current_playlist_index = new_index - 1 # Subtract 1 because the loop will increment
+                self.skip_event.set()
+                self.log(f"Jumping by {count} to video {new_index + 1}/{len(self.current_playlist_videos)}", "blue")
+                
+        # Case 2: We are in the main queue
+        elif self.main_queue:
+            new_index = self.main_queue_index + count
+            new_index = max(0, min(new_index, len(self.main_queue) - 1))
+            
+            if new_index != self.main_queue_index:
+                self.main_queue_index = new_index - 1 # Subtract 1 because the loop will increment
+                self.skip_event.set()
+                self.log(f"Jumping by {count} to video {new_index + 1}/{len(self.main_queue)}", "blue")
     
     def next_video(self):
         if not self.is_monitoring:
             return
         
-        # Check if we're in playlist mode
         if self.current_playlist_videos and self.current_playlist_index < len(self.current_playlist_videos) - 1:
             self.current_playlist_index += 1
             self.skip_event.set()
             self.log(f"Next button: Jumping to {self.current_playlist_index + 1}/{len(self.current_playlist_videos)}", "blue")
             self.update_playlist_info()
-        # Check if we're in main queue mode (when playlists are expanded)
         elif hasattr(self, 'main_queue') and self.main_queue and self.main_queue_index < len(self.main_queue) - 1:
-            # Set the skip event to interrupt current video
             self.skip_event.set()
             self.log(f"Next button: Skipping to next in queue ({self.main_queue_index + 2}/{len(self.main_queue)})", "blue")
         else:
             self.log("Next button: Already at end of queue/playlist.", "orange")
 
     def on_jump_entry(self, event=None):
-        if not self.is_monitoring or not self.current_playlist_videos:
+        """Handles the Enter key in the jump entry box for both queue types."""
+        if not self.is_monitoring:
             return
-        
+
         try:
-            target = int(self.jump_entry_var.get())
+            target_num = int(self.jump_entry_var.get())
             
-            if 1 <= target <= len(self.current_playlist_videos):
-                # Set the index and then trigger the skip event
-                self.current_playlist_index = target - 2  # Will be incremented to target-1 by the loop
-                self.skip_event.set()
-                self.log(f"Jumping to video {target}/{len(self.current_playlist_videos)}", "blue")
-            else:
-                self.log(f"Invalid video number. Please enter 1-{len(self.current_playlist_videos)}", "orange")
-                self.jump_entry_var.set(str(self.current_playlist_index + 1))
-                
+            # Case 1: We are inside a sequential playlist
+            if self.current_playlist_videos:
+                if 1 <= target_num <= len(self.current_playlist_videos):
+                    self.current_playlist_index = target_num - 2 # Will be incremented to target-1 by the loop
+                    self.skip_event.set()
+                    self.log(f"Jumping to video {target_num}/{len(self.current_playlist_videos)} in playlist", "blue")
+                else:
+                    self.log(f"Invalid video number. Please enter 1-{len(self.current_playlist_videos)}", "orange")
+                    self.jump_entry_var.set(str(self.current_playlist_index + 1))
+            
+            # Case 2: We are in the main queue
+            elif self.main_queue:
+                if 1 <= target_num <= len(self.main_queue):
+                    self.main_queue_index = target_num - 2 # Will be incremented to target-1 by the loop
+                    self.skip_event.set()
+                    self.log(f"Jumping to video {target_num}/{len(self.main_queue)} in main queue", "blue")
+                else:
+                    self.log(f"Invalid video number. Please enter 1-{len(self.main_queue)}", "orange")
+                    self.jump_entry_var.set(str(self.main_queue_index + 1))
+                    
         except ValueError:
             self.log("Please enter a valid number", "orange")
-            self.jump_entry_var.set(str(self.current_playlist_index + 1))
+            if self.current_playlist_videos:
+                self.jump_entry_var.set(str(self.current_playlist_index + 1))
+            elif self.main_queue:
+                self.jump_entry_var.set(str(self.main_queue_index + 1))
 
     def on_slider_change(self, value):
         if not self.is_monitoring or not self.current_playlist_videos:
@@ -3724,7 +3742,6 @@ class AudioMonitorApp:
         if not self.is_monitoring:
             return
         
-        # BUGFIX #3: Set the skip event to interrupt the current video's loop
         self.skip_event.set()
         self.log(f"Jumped to video {self.current_playlist_index + 1}/{len(self.current_playlist_videos)} via slider", "blue")
 
@@ -3744,15 +3761,12 @@ class AudioMonitorApp:
         if not self.is_monitoring:
             return
         
-        # Check if we're in playlist mode
         if self.current_playlist_videos and self.current_playlist_index > 0:
             self.current_playlist_index -= 1
             self.skip_event.set()
             self.log(f"Previous button: Jumping to {self.current_playlist_index + 1}/{len(self.current_playlist_videos)}", "blue")
             self.update_playlist_info()
-        # Check if we're in main queue mode (when playlists are expanded)
         elif hasattr(self, 'main_queue') and self.main_queue and self.main_queue_index > 0:
-            # We need to go back by 2 because the loop will increment by 1
             self.main_queue_index -= 2
             self.skip_event.set()
             self.log(f"Previous button: Going back in queue to {self.main_queue_index + 2}/{len(self.main_queue)})", "blue")
@@ -3806,7 +3820,6 @@ class AudioMonitorApp:
             elif self.is_paused:
                 state_text = "Paused"
             
-            # ENHANCED: Show actual video title in tooltip
             video_title = self.get_video_title(self.current_url)
             if len(video_title) > 30:
                 video_title = video_title[:27] + "..."
@@ -3820,7 +3833,6 @@ class AudioMonitorApp:
         is_playlist = bool(self.current_playlist_videos)
         if not self.is_monitoring: return Menu(item('Show', self.tray_show_window, default=True), item('Exit', self.quit_application))
         
-        # ENHANCED: Get actual title for tray menu
         now_playing_text = f"Playing: {self.get_video_title(self.current_url)}"
         now_playing_text = (now_playing_text[:50] + '...') if len(now_playing_text) > 50 else now_playing_text
         
@@ -3959,15 +3971,13 @@ class AudioMonitorApp:
 
     def fetch_thumbnail(self, url, for_now_playing=False):
         """
-        ENHANCED: Fetches thumbnails for videos and playlists using APIs where possible
-        and improved HTML scraping as a fallback.
+        Fetches thumbnails for videos and playlists.
         """
         img_data = None
         thumbnail_url = None
         try:
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
 
-            # --- NEW: Bilibili Playlist/Lists API Method ---
             bilibili_list_match = re.search(r'space.bilibili.com/\d+/(?:lists|favlist)/(\d+)', url)
             if bilibili_list_match:
                 media_id = bilibili_list_match.group(1)
@@ -3978,7 +3988,6 @@ class AudioMonitorApp:
                 data = response.json()
                 thumbnail_url = data.get('data', {}).get('info', {}).get('cover')
 
-            # --- MODIFIED: Handles BOTH YouTube Playlists and Single Videos ---
             if not thumbnail_url and ("youtube.com/playlist" in url or "youtube.com/watch" in url):
                 self.log(f"Fetching YouTube thumbnail via oEmbed API for: {url}", "cyan")
                 oembed_url = f"https://www.youtube.com/oembed?url={url}&format=json"
@@ -3987,7 +3996,6 @@ class AudioMonitorApp:
                 data = response.json()
                 thumbnail_url = data.get('thumbnail_url')
 
-            # Bilibili Video API Method
             bvid_match = re.search(r'/video/(BV[0-9A-Za-z]+)', url)
             if not thumbnail_url and bvid_match:
                 self.log(f"Fetching Bilibili video thumbnail via API for: {url}", "cyan")
@@ -3998,7 +4006,6 @@ class AudioMonitorApp:
                 data = response.json()
                 thumbnail_url = data.get('data', {}).get('pic')
 
-            # Fetch the image data if we found a URL
             if thumbnail_url:
                 if thumbnail_url.startswith("//"):
                     thumbnail_url = "https:" + thumbnail_url
@@ -4008,7 +4015,6 @@ class AudioMonitorApp:
                 img_response.raise_for_status()
                 img_data = img_response.content
 
-            # Display the result or handle failure
             if img_data:
                 self.thumbnail_cache[url] = img_data
                 if for_now_playing:
@@ -4074,11 +4080,9 @@ class AudioMonitorApp:
             else:
                 self.now_playing_progress_var.set(0)
         
-        # Keep the loop running as long as the card is visible
         if self.now_playing_frame.winfo_viewable():
             self.root.after(1000, self.update_now_playing_card)
 
-    # ✅ FEATURE: Welcome dialog for first-time users
     def show_first_time_welcome(self):
         """Displays a welcome message and setup instructions for first-time users."""
         messagebox.showinfo(
@@ -4089,39 +4093,33 @@ class AudioMonitorApp:
             "you MUST enable a 'loopback' audio device.\n\n"
             "On Windows, this is usually called 'Stereo Mix'. You may need to enable it in your Sound Control Panel.\n\n"
             "After enabling it, please select it from the 'Audio Input Device' dropdown. "
-            "You can find this in: ⚙️ Advanced Settings -> Audio tab.\n\n"
+            "You can find this in: Settings Tab -> Audio.\n\n"
             "Enjoy the app!",
             parent=self.root
         )
 
 def extract_bilibili_title(html, url):
     """Helper function to extract Bilibili titles using multiple fallbacks."""
-    # Try og:title first, as it's often the most accurate
     og_title = re.search(r'<meta property="og:title" content="([^"]+)"', html)
     if og_title and og_title.group(1).strip():
         return og_title.group(1).strip()
-    # Try the main page title
     page_title = re.search(r'<title>(.*?)_哔哩哔哩_bilibili</title>', html)
     if not page_title:
         page_title = re.search(r'<title>(.*?)</title>', html)
     if page_title and page_title.group(1).strip():
         return page_title.group(1).strip()
-    # Try the first h1 tag
     h1 = re.search(r'<h1[^>]*>(.*?)</h1>', html)
     if h1 and h1.group(1).strip():
         return h1.group(1).strip()
-    # Try specific class names for playlists/collections
     fav_name = re.search(r'class="fav-name[^"]*"[^>]*>([^<]+)</', html)
     if fav_name and fav_name.group(1).strip():
         return fav_name.group(1).strip()
     media_title = re.search(r'class="media-title[^"]*"[^>]*>([^<]+)</', html)
     if media_title and media_title.group(1).strip():
         return media_title.group(1).strip()
-    # Try JSON-like data embedded in the page
     list_title = re.search(r'"listTitle":"([^"]+)"', html)
     if list_title and list_title.group(1).strip():
         return list_title.group(1).strip()
-    # Fallback to generic names based on URL structure
     if "upload/video" in url: return "User Uploads"
     if "/lists/" in url: return "User Playlist"
     if "/search" in url: return "Search Results"
@@ -4130,19 +4128,16 @@ def extract_bilibili_title(html, url):
 if __name__ == "__main__":
     try:
         if sys.platform == "win32":
-            # Helps with UI scaling on Windows
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         root = ttk.Window(themename="superhero")
         app = AudioMonitorApp(root)
         root.mainloop()
     except Exception as e:
-        # Generic fallback for any initialization errors
         error_root = tk.Tk()
-        error_root.withdraw() # Hide the empty root window
+        error_root.withdraw()
         messagebox.showerror(
             "Fatal Error",
             f"An unexpected error occurred and the application must close:\n\n{e}\n\n"
             f"Please check the log file '{LOG_FILE}' for more details."
         )
-        # Log the full traceback
         logging.critical("Fatal error on startup", exc_info=True)
