@@ -2541,16 +2541,22 @@ class AudioMonitorApp:
                 if self.mpv_process and self.mpv_process.poll() is not None:
                     self.log("MPV closed. Stopping.", "orange"); break
                 
+                # --- START: CORRECTED LOGIC ---
+                # Always check the player's state first to sync the app's internal state.
+                is_player_paused = self.get_player_paused_state()
+                if self.sync_video_pause_var.get():
+                    # If the player is playing but the app thinks it's paused, resume the app.
+                    if is_player_paused is False and self.is_paused:
+                        self.root.after(0, self.resume_monitoring, True)
+                    # If the player is paused but the app thinks it's playing, pause the app.
+                    elif is_player_paused is True and not self.is_paused:
+                        self.root.after(0, self.pause_monitoring, True)
+                
+                # Now that the app state is synced, if we are paused, skip the rest of the loop.
                 if self.is_paused:
                     time.sleep(1)
                     continue
-                
-                is_player_paused = self.get_player_paused_state()
-                if self.sync_video_pause_var.get():
-                    if is_player_paused and not self.is_paused:
-                        self.root.after(0, self.pause_monitoring, True)
-                    elif not is_player_paused and self.is_paused:
-                        self.root.after(0, self.resume_monitoring, True)
+                # --- END: CORRECTED LOGIC ---
 
                 if self.auto_skip_var.get() and self.is_video_ended():
                     self.log("Video ended, moving to next in playlist.", "blue")
@@ -3629,16 +3635,22 @@ class AudioMonitorApp:
                     self.log("MPV closed. Stopping video handler.", "orange")
                     break
 
+                # --- START: CORRECTED LOGIC ---
+                # Always check the player's state first to sync the app's internal state.
+                is_player_paused = self.get_player_paused_state()
+                if self.sync_video_pause_var.get():
+                    # If the player is playing but the app thinks it's paused, resume the app.
+                    if is_player_paused is False and self.is_paused:
+                        self.root.after(0, self.resume_monitoring, True)
+                    # If the player is paused but the app thinks it's playing, pause the app.
+                    elif is_player_paused is True and not self.is_paused:
+                        self.root.after(0, self.pause_monitoring, True)
+
+                # Now that the app state is synced, if we are paused, skip the rest of the loop.
                 if self.is_paused:
                     time.sleep(0.5)
                     continue
-
-                is_player_paused = self.get_player_paused_state()
-                if self.sync_video_pause_var.get():
-                    if is_player_paused and not self.is_paused:
-                        self.root.after(0, self.pause_monitoring, True)
-                    elif not is_player_paused and self.is_paused:
-                        self.root.after(0, self.resume_monitoring, True)
+                # --- END: CORRECTED LOGIC ---
 
                 if self.auto_skip_var.get() and self.is_video_ended():
                     self.log("Video ended", "blue")
