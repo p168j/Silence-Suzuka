@@ -230,6 +230,9 @@ class AudioMonitorApp:
         self.playlist_exhausted = False
         self.custom_settings_frame = None # To hold the custom settings frame widget
         self.keybind_window = None # To ensure only one help window opens
+        self.last_sort_column = None
+        self.last_sort_reverse = False
+        self.keybind_window = None # To ensure only one help window opens
         # --- ENHANCED: Audio visualization variables ---
         self.visualization_mode_var = tk.StringVar(value="bar")
         self.audio_buffer = deque(maxlen=4410)  # 0.1 second buffer at 44100 Hz
@@ -568,11 +571,17 @@ class AudioMonitorApp:
         ToolTip(self.search_entry, "Filter playlist by title or URL")
         self.root.style.configure('Treeview', font=(get_japanese_font(), 12), rowheight=35)
         self.root.style.configure('Treeview.Heading', font=(get_japanese_font(), 10, 'bold'))
-        columns = ("title", "url", "type")
+        columns = ("status", "title", "url", "type")
         self.url_tree = ttk.Treeview(self.url_frame, columns=columns, show="headings", bootstyle="primary", height=10)
-        self.url_tree.heading("title", text="Title")
-        self.url_tree.heading("url", text="Source")
-        self.url_tree.heading("type", text="Type")
+        
+        # --- Column Headers (with sorting commands) ---
+        self.url_tree.heading("status", text="📊", command=lambda: self.sort_treeview_column("status", False))
+        self.url_tree.heading("title", text="Title", command=lambda: self.sort_treeview_column("title", False))
+        self.url_tree.heading("url", text="Source") # Not sortable
+        self.url_tree.heading("type", text="Type", command=lambda: self.sort_treeview_column("type", False))
+        
+        # --- Column Configuration ---
+        self.url_tree.column("status", stretch=False, width=40, anchor=tk.CENTER)
         self.url_tree.column("title", stretch=True, minwidth=300, width=500, anchor=tk.W)
         self.url_tree.column("url", stretch=True, minwidth=100, anchor=tk.W)
         self.url_tree.column("type", stretch=False, minwidth=60, width=80, anchor=tk.CENTER)
@@ -689,6 +698,56 @@ class AudioMonitorApp:
         
         # --- 3. Final Initialization ---
         self.root.after(100, self.initialize_visualization)
+    def get_status_emoji(self, url):
+        """Gets a status emoji based on the video's saved timestamp."""
+        status = self.get_saved_timestamp_status(url)
+        if status == "finished":
+            return "✅"  # Watched
+        elif isinstance(status, (int, float)) and status > 0:
+            return "◐"  # In Progress
+        else:
+            return ""  # Unwatched
+
+    def sort_treeview_column(self, col, reverse):
+        """Sorts a treeview column when its header is clicked."""
+        # Check if we are sorting the same column again to toggle direction
+        if col == self.last_sort_column:
+            reverse = not self.last_sort_reverse
+        else:
+            reverse = False
+
+        # Get data from the column
+        try:
+            data_list = [(self.url_tree.set(k, col).lower(), k) for k in self.url_tree.get_children('')]
+        except tk.TclError: # Fallback for columns with potential errors
+            return
+
+        # Sort the data
+        data_list.sort(key=lambda t: t[0], reverse=reverse)
+
+        # Rearrange items in the treeview
+        for index, (val, k) in enumerate(data_list):
+            self.url_tree.move(k, '', index)
+
+        # Update the command for the next click to be reversed
+        self.url_tree.heading(col, command=lambda: self.sort_treeview_column(col, not reverse))
+        
+        # Store the last sort state
+        self.last_sort_column = col
+        self.last_sort_reverse = reverse
+
+    def update_item_status_in_treeview(self, url_to_update):
+        """Finds a specific item in the treeview by URL and updates its status icon."""
+        url_to_update = self._clean_url(url_to_update)
+        new_status_emoji = self.get_status_emoji(url_to_update)
+        
+        for item_id in self.url_tree.get_children():
+            values = self.url_tree.item(item_id, 'values')
+            if values and len(values) > 2 and self._clean_url(values[2]) == url_to_update:
+                # Rebuild the values tuple with the new status
+                new_values = (new_status_emoji, values[1], values[2], values[3])
+                self.url_tree.item(item_id, values=new_values)
+                break # Stop after finding and updating the item    
 
     def show_keybinds(self, event=None):
         """Displays a Toplevel window with a list of all available keybinds, ensuring only one instance exists."""
@@ -1198,6 +1257,7 @@ class AudioMonitorApp:
         
         self.stats[today].setdefault('timestamps', {})[clean_url] = -1
         self.save_stats()
+        self.update_item_status_in_treeview(url)
         self.log(f"Marked '{self.get_display_name(url)}' as watched.", "blue")
 
     def mark_as_unwatched(self):
@@ -1216,6 +1276,7 @@ class AudioMonitorApp:
                     del data['timestamps'][clean_url]
                     
         self.save_stats()
+        self.update_item_status_in_treeview(url)
         self.log(f"Marked '{self.get_display_name(url)}' as unwatched.", "blue")
 
     def on_playlist_mode_change(self, event=None):
@@ -1640,8 +1701,10 @@ class AudioMonitorApp:
         selected_items = self.url_tree.selection()
         if not selected_items: messagebox.showinfo("No Selection", "Please select a URL to remove."); return
         
-        urls_to_remove = {self.url_tree.item(item, 'values')[1] for item in selected_items}
+        # CORRECTED: Get URL from index [2] instead of [1]
+        urls_to_remove = {self.url_tree.item(item, 'values')[2] for item in selected_items}
         
+        # This part remains the same
         for item in selected_items:
             self.url_tree.delete(item)
             
@@ -2091,23 +2154,28 @@ class AudioMonitorApp:
         try:
             self.log(f"Attempting to update treeview item {item_id} with title: '{new_title}'", "cyan")
             
+            # Find the original data in our master list using the temporary item_id
             target_item_data = next((item for item in self.all_tree_items if item.get('id') == item_id), None)
             
-            if target_item_data:
-                target_item_data['title'] = new_title
-                target_url = target_item_data['url']
-                self.log(f"Updated internal data for item {item_id} (URL: {target_url})", "green")
-            else:
+            if not target_item_data:
                 self.log(f"Could not find item {item_id} in internal data. It may have been removed.", "orange")
                 return
 
+            # Update the title in the master list and get the URL
+            target_item_data['title'] = new_title
+            target_url = target_item_data['url']
+            self.log(f"Updated internal data for item {item_id} (URL: {target_url})", "green")
+
+            # Now find the item in the visible treeview and update it
             for tree_item_id in self.url_tree.get_children():
                 try:
                     values = self.url_tree.item(tree_item_id, 'values')
-                    if len(values) >= 2 and values[1] == target_url:
-                        new_values = (new_title, values[1], values[2] if len(values) > 2 else 'Video')
+                    # CORRECTED: Check URL at index [2] and ensure 4 columns exist
+                    if len(values) >= 4 and values[2] == target_url:
+                        # CORRECTED: Rebuild the 4-column tuple with the new title at index [1]
+                        new_values = (values[0], new_title, values[2], values[3])
                         self.url_tree.item(tree_item_id, values=new_values)
-                        self.log(f"Found and updated treeview item by URL: {target_url}", "green")
+                        self.log(f"Found and updated visible treeview item for URL: {target_url}", "green")
                         return
                 except tk.TclError:
                     continue
@@ -3249,9 +3317,13 @@ class AudioMonitorApp:
                 self.log(f"Profile '{profile_to_delete}' deleted.", "blue")
             
     def get_items_from_display(self):
+        """Gets all items from the Treeview display for saving."""
         items = []
         for item_id in self.url_tree.get_children():
-            values = self.url_tree.item(item_id, 'values'); items.append({'title': values[0], 'url': values[1], 'type': values[2]})
+            values = self.url_tree.item(item_id, 'values')
+            # Corrected indices to account for the new "status" column at values[0]
+            if len(values) >= 4:
+                items.append({'title': values[1], 'url': values[2], 'type': values[3]})
         return items
 
     def load_stats(self):
@@ -3309,19 +3381,32 @@ class AudioMonitorApp:
             self.stats[today].setdefault('timestamps', {})[timestamp_url] = timestamp
             self.log(f"Timestamp {timestamp:.1f}s saved for {self.get_display_name(timestamp_url, format_type='log')}", "blue")
 
+        self.update_item_status_in_treeview(timestamp_url)    
+
     def manual_save_timestamp(self):
         if not self.is_monitoring: self.log("Cannot save timestamp when not playing.", "orange"); return
         self.save_current_timestamp(); self.save_stats()
 
     def update_playlist_ui(self):
-        """Updates the playlist UI elements like title and count."""
+        """Updates the playlist UI elements like title, count, and status icons."""
+        # Preserve the current selection and view
+        selected_items = self.url_tree.selection()
+
         self.url_tree.delete(*self.url_tree.get_children())
         for item in self.all_tree_items:
-            self.url_tree.insert("", tk.END, values=(item.get('title'), item.get('url'), item.get('type')))
-        
+            status_emoji = self.get_status_emoji(item.get('url'))
+            self.url_tree.insert("", tk.END, values=(status_emoji, item.get('title'), item.get('url'), item.get('type')))
+
         count = len(self.all_tree_items)
         self.url_frame.config(text=f"Playlist ({count} items) 📝")
-        
+
+        # Re-apply selection
+        try:
+            if selected_items:
+                self.url_tree.selection_set(selected_items)
+        except tk.TclError:
+            pass # Items may no longer exist, which is fine
+
         self.update_window_title()
 
     def is_local_file(self, path): return os.path.isfile(path) and not path.startswith(('http://', 'https://'))
