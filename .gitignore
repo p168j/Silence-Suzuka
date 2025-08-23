@@ -6,3 +6,6 @@ audio_monitor.log
 # Python cache files
 __pycache__/
 *.pyc
+
+# .gitignore
+backup/
