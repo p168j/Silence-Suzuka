@@ -224,6 +224,7 @@ class AudioMonitorApp:
         self.skip_event = threading.Event()
         self.skip_to_next_in_playlist = False
         self.playlist_exhausted = False
+        self.custom_settings_frame = None # To hold the custom settings frame widget
 
         # --- ENHANCED: Audio visualization variables ---
         self.visualization_mode_var = tk.StringVar(value="bar")
@@ -281,6 +282,9 @@ class AudioMonitorApp:
         self.start_audio_preview()
         self.start_afk_detector()
         self.update_flicker_free_indicator() # Start the flicker-free loop
+        
+        # --- MODIFICATION: Set initial state of checkboxes on startup ---
+        self.on_playlist_mode_change()
 
         print("Application initialized successfully!")
         self.log("Application ready with a modern UI!")
@@ -319,29 +323,33 @@ class AudioMonitorApp:
         return url.split('/')[-1][:50] if '/' in url else url[:50]
         
     def always_expand_playlists(self, urls):
-        """Expand the first playlist in the queue into its individual videos, if present."""
+        """MODIFIED: Expand the first playlist in the queue using a temporary headless browser."""
         if not urls:
             return []
+
         first_url = urls[0]
         url_type = self.get_url_type(first_url)
+        
         # Only expand if it's a playlist and not treat_playlists_as_videos
         if url_type == "Playlist" and not self.treat_playlists_as_videos_var.get():
-            self.log(f"Expanding playlist before playback: {first_url}", "blue")
-            # Use the main browser for scraping
-            if not self.browser or not self.is_browser_responsive():
-                self.setup_browser()
-            if self.browser:
-                videos = self.get_playlist_videos(self.browser, first_url)
-                # If expansion fails, fallback to original url
+            self.log(f"Expanding first playlist headlessly: {first_url}", "blue")
+            try:
+                options = uc.ChromeOptions()
+                options.add_argument("--headless=new")
+                options.add_argument("--mute-audio")
+                with uc.Chrome(options=options, patcher_force_close=True) as temp_browser:
+                    videos = self.get_playlist_videos(temp_browser, first_url)
+                
                 if not videos or (len(videos) == 1 and videos[0] == first_url):
-                    self.log(f"Playlist expansion failed, playing as single item.", "orange")
-                    return urls
+                    self.log("Playlist expansion failed or returned no videos. Playing as single item.", "orange")
+                    return urls # Fallback to original list
                 else:
                     self.log(f"Expanded playlist into {len(videos)} videos.", "green")
-                    return videos
-            else:
-                self.log(f"Could not set up browser for playlist expansion.", "red")
-                return urls
+                    # Replace the original playlist URL with the expanded video list
+                    return videos + urls[1:]
+            except Exception as e:
+                self.log(f"Could not set up headless browser for playlist expansion: {e}", "red")
+                return urls # Fallback to original list on error
         else:
             return urls
         
@@ -411,23 +419,34 @@ class AudioMonitorApp:
             self.root.clipboard_append(url)
             self.log(f"Copied link to clipboard: {url}", 'blue')
 
+    def _autosave_settings(self, *args):
+        """
+        A simple wrapper to call save_profile for autosaving.
+        This is triggered by UI element commands, bindings, and variable traces.
+        """
+        # This check prevents saving an empty/default profile during app initialization
+        # before the user's actual profile has been loaded.
+        if self.active_profile_name.get():
+            self.save_profile()
+
     def on_theme_change(self, *args):
         """Called when the theme dropdown changes."""
         theme_name = self.theme_var.get()
         self.root.style.theme_use(theme_name)
         self._apply_custom_font_styles() # Re-apply custom fonts
         self.update_visualization_theme()
-        self.save_profile()
-        
+        # AUTOSAVE CHANGE: We now call the autosave function directly.
+        self._autosave_settings()
+
     def _apply_custom_font_styles(self):
         """Applies a consistent, language-aware font to key widgets after a theme change."""
         # Use a standard, simple font like Arial to avoid rendering bugs
-        font_name = "Arial" 
-        
+        font_name = "Arial"
+
         # Configure the general style (for themes like litera, darkly)
         self.root.style.configure('Treeview', font=(font_name, 12))
         self.root.style.configure('Treeview.Heading', font=(font_name, 10, 'bold'))
-        
+
         # Configure the specific 'primary' style (for the superhero theme)
         self.root.style.configure('primary.Treeview', font=(font_name, 12))
         self.root.style.configure('primary.Treeview.Heading', font=(font_name, 10, 'bold'))
@@ -521,7 +540,19 @@ class AudioMonitorApp:
         # --- NEW: Clear All Button ---
         ttk.Button(playlist_button_frame, text="🗑️ Clear All",
                    command=self.clear_all_urls,
-                   bootstyle="danger-outline").pack(side=tk.RIGHT, padx=5)
+                   bootstyle="danger-outline").pack(side=tk.LEFT, padx=5)
+        
+        # --- START MODIFICATION: Add Playlist Mode Combobox to main GUI ---
+        main_playlist_mode_combo = ttk.Combobox(playlist_button_frame, textvariable=self.playlist_mode_var,
+                                                values=["Sequential", "Shuffle All", "True Random", "Smart Shuffle", "Custom"],
+                                                state="readonly",
+                                                width=15)
+        main_playlist_mode_combo.pack(side=tk.RIGHT, padx=5)
+        ToolTip(main_playlist_mode_combo, "Select a playback mode preset")
+        main_playlist_mode_combo.bind("<<ComboboxSelected>>", self.on_playlist_mode_change)
+
+        ttk.Label(playlist_button_frame, text="Playlist Mode:").pack(side=tk.RIGHT)
+        # --- END MODIFICATION ---
         
         self.url_tree.bind("<ButtonPress-1>", self.on_drag_start)
         self.url_tree.bind("<B1-Motion>", self.on_drag_motion)
@@ -637,6 +668,30 @@ class AudioMonitorApp:
         # Add at the end of create_widgets:
         self.root.after(100, self.initialize_visualization)
 
+
+    def _create_check(self, parent_widget, text, var, tip):
+        """Creates a checkbutton with a tooltip and autosave command."""
+        cb = ttk.Checkbutton(parent_widget, text=text, variable=var, bootstyle="primary", command=self._autosave_settings)
+        cb.pack(anchor='w', padx=5, pady=2)
+        ToolTip(cb, tip)
+
+    def _create_playlist_check(self, parent_widget, text, var, tip):
+        """Creates a playlist-specific checkbutton with a tooltip and autosave command."""
+        cb = ttk.Checkbutton(parent_widget, text=text, variable=var, bootstyle="primary", command=self.on_custom_setting_change)
+        cb.pack(anchor='w', padx=5, pady=2)
+        ToolTip(cb, tip)
+
+    def _create_slider_with_label(self, parent_widget, label_text, variable, from_, to, tip):
+        """Creates a labeled slider with a tooltip and autosave command."""
+        frame = ttk.Frame(parent_widget)
+        frame.pack(fill=tk.X, expand=True, pady=(10, 0))
+        label = ttk.Label(frame, text=label_text, width=15)
+        label.pack(side=tk.LEFT, padx=(0, 10))
+        slider = ttk.Scale(frame, from_=from_, to=to, variable=variable, command=self._autosave_settings)
+        slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ToolTip(slider, tip)
+        return slider    
+
     # ✅ FEATURE: Advanced Settings Window - All settings UI is now created in this separate method.
     def _create_settings_panel(self, parent):
         """Creates the advanced settings UI inside the given parent widget."""
@@ -661,21 +716,17 @@ class AudioMonitorApp:
         # --- Subscriptions Tab ---
         subs_frame = ttk.Labelframe(subscriptions_tab, text="Channel/Folder Subscriptions", padding=10)
         subs_frame.pack(fill=tk.BOTH, expand=True)
-        
         self.subs_tree = ttk.Treeview(subs_frame, columns=("source", "type"), show="headings", height=5)
         self.subs_tree.heading("source", text="Source")
         self.subs_tree.heading("type", text="Type")
-        self.subs_tree.column("source", stretch=True)
-        self.subs_tree.column("type", width=80, anchor=tk.CENTER)
         self.subs_tree.pack(fill=tk.BOTH, expand=True)
-        
         subs_buttons = ttk.Frame(subs_frame)
         subs_buttons.pack(fill=tk.X, pady=5)
         ttk.Button(subs_buttons, text="Add", command=self.add_subscription, bootstyle="info-outline").pack(side=tk.LEFT, padx=2)
         ttk.Button(subs_buttons, text="Remove", command=self.remove_subscription, bootstyle="danger-outline").pack(side=tk.LEFT, padx=2)
         ttk.Button(subs_buttons, text="Refresh All", command=self.refresh_subscriptions, bootstyle="success-outline").pack(side=tk.RIGHT, padx=2)
 
-        # --- Playlist Tab with Quick Mode ---
+        # --- Playlist Tab ---
         quick_mode_frame = ttk.Labelframe(playlist_tab, text="Quick Mode", padding=10)
         quick_mode_frame.pack(fill=tk.X, pady=5)
         self.playlist_mode_combo = ttk.Combobox(quick_mode_frame, textvariable=self.playlist_mode_var,
@@ -685,70 +736,63 @@ class AudioMonitorApp:
         ToolTip(self.playlist_mode_combo, "Select a playback mode preset")
         self.playlist_mode_combo.bind("<<ComboboxSelected>>", self.on_playlist_mode_change)
 
-        custom_settings_frame = ttk.Labelframe(playlist_tab, text="Custom Settings", padding=10)
-        custom_settings_frame.pack(fill=tk.X, pady=5)
+        self.custom_settings_frame = ttk.Labelframe(playlist_tab, text="Custom Settings", padding=10)
+        self.custom_settings_frame.pack(fill=tk.X, pady=5)
 
-        def create_playlist_check(parent_widget, text, var, tip):
-            cb = ttk.Checkbutton(parent_widget, text=text, variable=var, bootstyle="primary", command=self.on_custom_setting_change)
-            cb.pack(anchor='w', padx=5, pady=2)
-            ToolTip(cb, tip)
-
-        create_playlist_check(custom_settings_frame, "Expand All Playlists", self.expand_playlists_var, "Scrape all videos from all playlists into one single list before starting.")
-        create_playlist_check(custom_settings_frame, "Randomize List Order", self.random_list_var, "Randomize the order of items in the main list.")
-        create_playlist_check(custom_settings_frame, "True Random on Skip", self.true_random_on_skip_var, "Picks a new random video from the entire pool on every skip/end.")
-        create_playlist_check(custom_settings_frame, "Smart Shuffle", self.smart_shuffle_var, "Shuffles unwatched videos first, then plays watched videos.")
-        create_playlist_check(custom_settings_frame, "Shuffle Videos Within Playlists", self.shuffle_within_playlists_var, "Shuffle the order of videos inside each playlist as it's played.")
-        create_playlist_check(custom_settings_frame, "Sequential Playlist Playback", self.sequential_playlists_var, "Play each playlist completely before moving to the next item in the list.")
-        create_playlist_check(custom_settings_frame, "Treat all playlists as single videos", self.treat_playlists_as_videos_var, "If checked, playlists will not be expanded and will be treated as single videos.")
+        self._create_playlist_check(self.custom_settings_frame, "Expand All Playlists", self.expand_playlists_var, "Scrape all videos from all playlists into one single list before starting.")
+        self._create_playlist_check(self.custom_settings_frame, "Randomize List Order", self.random_list_var, "Randomize the order of items in the main list.")
+        self._create_playlist_check(self.custom_settings_frame, "True Random on Skip", self.true_random_on_skip_var, "Picks a new random video from the entire pool on every skip/end.")
+        self._create_playlist_check(self.custom_settings_frame, "Smart Shuffle", self.smart_shuffle_var, "Shuffles unwatched videos first, then plays watched videos.")
+        self._create_playlist_check(self.custom_settings_frame, "Shuffle Videos Within Playlists", self.shuffle_within_playlists_var, "Shuffle the order of videos inside each playlist as it's played.")
+        self._create_playlist_check(self.custom_settings_frame, "Sequential Playlist Playback", self.sequential_playlists_var, "Play each playlist completely before moving to the next item in the list.")
+        self._create_playlist_check(self.custom_settings_frame, "Treat all playlists as single videos", self.treat_playlists_as_videos_var, "If checked, playlists will not be expanded and will be treated as single videos.")
         
-        # --- Other Tabs ---
+        # --- Profile Tab ---
         profile_management_frame = ttk.Labelframe(profile_tab, text="Profile Management", padding="10")
         profile_management_frame.pack(fill=tk.X, pady=5)
         self.profile_combobox = ttk.Combobox(profile_management_frame, textvariable=self.active_profile_name, state="readonly")
         self.profile_combobox.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         ToolTip(self.profile_combobox, "Switch between saved setting profiles")
         self.profile_combobox.bind("<<ComboboxSelected>>", self.on_profile_select)
-        self.new_profile_btn = ttk.Button(profile_management_frame, text="New", command=self.new_profile, bootstyle="info-outline")
-        self.new_profile_btn.pack(side=tk.LEFT, padx=5)
-        self.copy_profile_btn = ttk.Button(profile_management_frame, text="Copy", command=self.copy_profile, bootstyle="info-outline")
-        self.copy_profile_btn.pack(side=tk.LEFT, padx=5)
-        self.save_profile_btn = ttk.Button(profile_management_frame, text="Save", command=self.save_profile, bootstyle="success-outline")
-        self.save_profile_btn.pack(side=tk.LEFT, padx=5)
-        self.delete_profile_btn = ttk.Button(profile_management_frame, text="Delete", command=self.delete_profile, bootstyle="danger-outline")
-        self.delete_profile_btn.pack(side=tk.LEFT, padx=5)
+        ttk.Button(profile_management_frame, text="New", command=self.new_profile, bootstyle="info-outline").pack(side=tk.LEFT, padx=5)
+        ttk.Button(profile_management_frame, text="Copy", command=self.copy_profile, bootstyle="info-outline").pack(side=tk.LEFT, padx=5)
+        ttk.Button(profile_management_frame, text="Save", command=self.save_profile, bootstyle="success-outline").pack(side=tk.LEFT, padx=5)
+        ttk.Button(profile_management_frame, text="Delete", command=self.delete_profile, bootstyle="danger-outline").pack(side=tk.LEFT, padx=5)
         
+        # --- Paths Tab ---
         chrome_profile_frame = ttk.Frame(paths_tab, padding=5)
         chrome_profile_frame.pack(fill=tk.X)
         self.profile_path_entry = ttk.Entry(chrome_profile_frame, textvariable=self.profile_path_var, width=50)
         self.profile_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
         ToolTip(self.profile_path_entry, "Chrome User Data Directory (e.g., C:\\Users\\...\\AppData\\Local\\Google\\Chrome\\User Data)")
+        self.profile_path_var.trace("w", self._autosave_settings)
+
         self.profile_name_entry = ttk.Entry(chrome_profile_frame, textvariable=self.profile_name_var, width=20)
         self.profile_name_entry.pack(side=tk.LEFT, padx=(0, 10))
         ToolTip(self.profile_name_entry, "Chrome Profile Name (e.g., Profile 1)")
+        self.profile_name_var.trace("w", self._autosave_settings)
 
         mpv_frame = ttk.Frame(paths_tab, padding=5)
         mpv_frame.pack(fill=tk.X)
         self.mpv_path_entry = ttk.Entry(mpv_frame, textvariable=self.mpv_path_var, width=50)
         self.mpv_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         ToolTip(self.mpv_path_entry, "Path to MPV executable")
+        self.mpv_path_var.trace("w", self._autosave_settings)
         ttk.Button(mpv_frame, text="Browse", command=self.browse_mpv_path, bootstyle="secondary").pack(side=tk.LEFT, padx=(0, 10))
         
-        def create_check(parent_widget, text, var, tip):
-            cb = ttk.Checkbutton(parent_widget, text=text, variable=var, bootstyle="primary")
-            cb.pack(anchor='w', padx=5, pady=2)
-            ToolTip(cb, tip)
-
-        create_check(general_tab, "Headless", self.headless_var, "Run browser in the background without a visible window.")
-        create_check(general_tab, "Fetch Titles", self.fetch_titles_var, "Automatically fetch titles for web URLs. Can be slow.")
-        create_check(general_tab, "Save Timestamps", self.save_timestamp_var, "Save the last video position and daily usage stats.")
-        create_check(general_tab, "Keep Browser Open", self.keep_browser_open_var, "If checked, the browser will not close when you click 'Stop Playing'.")
-        create_check(general_tab, "Auto-start Playing", self.autostart_var, "Automatically start playing when the application launches.")
+        # --- General Tab ---
+        self._create_check(general_tab, "Headless", self.headless_var, "Run browser in the background without a visible window.")
+        self._create_check(general_tab, "Fetch Titles", self.fetch_titles_var, "Automatically fetch titles for web URLs. Can be slow.")
+        self._create_check(general_tab, "Save Timestamps", self.save_timestamp_var, "Save the last video position and daily usage stats.")
+        self._create_check(general_tab, "Keep Browser Open", self.keep_browser_open_var, "If checked, the browser will not close when you click 'Stop Playing'.")
+        self._create_check(general_tab, "Auto-start Playing", self.autostart_var, "Automatically start playing when the application launches.")
         
         gen_row2 = ttk.Frame(general_tab)
         gen_row2.pack(fill=tk.X, pady=2)
         self.delay_entry = ttk.Entry(gen_row2, textvariable=self.delay_minutes_var, width=5)
         self.delay_entry.pack(side=tk.LEFT, padx=5)
         ToolTip(self.delay_entry, "Start Delay (minutes)")
+        self.delay_minutes_var.trace("w", self._autosave_settings)
         
         theme_menu = ttk.Combobox(gen_row2, textvariable=self.theme_var, values=THEMES, state="readonly", width=10)
         theme_menu.pack(side=tk.RIGHT, padx=5)
@@ -757,61 +801,52 @@ class AudioMonitorApp:
         gen_row3 = ttk.Frame(general_tab)
         gen_row3.pack(fill=tk.X, pady=2)
         if (sys.platform == "win32") or (pynput_mouse and pynput_keyboard):
-            create_check(gen_row3, "Pause when AFK", self.afk_enabled_var, "Prevent autoplaying the next video if no mouse/keyboard activity is detected.")
+            self._create_check(gen_row3, "Pause when AFK", self.afk_enabled_var, "Prevent autoplaying the next video if no mouse/keyboard activity is detected.")
             afk_entry = ttk.Entry(gen_row3, textvariable=self.afk_timeout_minutes_var, width=5)
             afk_entry.pack(side=tk.LEFT, padx=10)
             ToolTip(afk_entry, "AFK Timeout (minutes)")
-            create_check(gen_row3, "Show AFK status in UI", self.show_afk_status_var, "Display AFK status in the main status label.")
+            self.afk_timeout_minutes_var.trace("w", self._autosave_settings)
+            self._create_check(gen_row3, "Show AFK status in UI", self.show_afk_status_var, "Display AFK status in the main status label.")
         else:
             ttk.Label(gen_row3, text="AFK feature disabled: requires 'pynput' library on this OS.", bootstyle="danger").pack(side=tk.LEFT, padx=5)
         
-        create_check(playback_tab, "Auto-skip Ended", self.auto_skip_var, "Automatically skip to the next URL when the current video ends.")
-        create_check(playback_tab, "Sync with Video Pause", self.sync_video_pause_var, "Automatically pause/resume playing when the video is paused/resumed in the player.")
-        create_check(playback_tab, "Unmute Video", self.unmute_var, "Play video with sound (requires browser reload).")
-        create_check(playback_tab, "Use MPV for Local Files", self.use_mpv_var, "Use MPV media player for local video files instead of browser.")
+        # --- Playback Tab ---
+        self._create_check(playback_tab, "Auto-skip Ended", self.auto_skip_var, "Automatically skip to the next URL when the current video ends.")
+        self._create_check(playback_tab, "Sync with Video Pause", self.sync_video_pause_var, "Automatically pause/resume playing when the video is paused/resumed in the player.")
+        self._create_check(playback_tab, "Unmute Video", self.unmute_var, "Play video with sound (requires browser reload).")
+        self._create_check(playback_tab, "Use MPV for Local Files", self.use_mpv_var, "Use MPV media player for local video files instead of browser.")
         
         percentage_frame = ttk.Frame(playback_tab)
         percentage_frame.pack(fill=tk.X, pady=5)
         self.percentage_entry = ttk.Entry(percentage_frame, textvariable=self.finished_percentage_var, width=5)
         self.percentage_entry.pack(side=tk.LEFT, padx=(0, 5))
         ToolTip(self.percentage_entry, "Finished Threshold (%)")
+        self.finished_percentage_var.trace("w", self._autosave_settings)
 
+        # --- Audio Tab ---
         audio_device_frame = ttk.Frame(audio_tab)
         audio_device_frame.pack(fill=tk.X, expand=True)
         self.audio_device_menu = ttk.Combobox(audio_device_frame, textvariable=self.audio_device_var, state="readonly")
         self.audio_device_menu.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ToolTip(self.audio_device_menu, "Audio Input Device (e.g., Stereo Mix)")
+        self.audio_device_menu.bind("<<ComboboxSelected>>", self._autosave_settings)
         
-        # ENHANCED: Visualization mode selector
         viz_frame = ttk.Labelframe(audio_tab, text="Visualization Mode", padding=10)
         viz_frame.pack(fill=tk.X, pady=(10, 0))
         
-        ttk.Radiobutton(viz_frame, text="Simple Bar", variable=self.visualization_mode_var, 
-                        value="bar", command=self.switch_visualization).pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(viz_frame, text="Waveform", variable=self.visualization_mode_var, 
-                        value="waveform", command=self.switch_visualization).pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(viz_frame, text="Spectrum", variable=self.visualization_mode_var, 
-                        value="spectrum", command=self.switch_visualization).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(viz_frame, text="Simple Bar", variable=self.visualization_mode_var, value="bar", command=self.switch_visualization).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(viz_frame, text="Waveform", variable=self.visualization_mode_var, value="waveform", command=self.switch_visualization).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(viz_frame, text="Spectrum", variable=self.visualization_mode_var, value="spectrum", command=self.switch_visualization).pack(side=tk.LEFT, padx=5)
 
-        # --- FIX: Add labels to sliders ---
-        def create_slider_with_label(parent_widget, label_text, variable, from_, to, tip):
-            frame = ttk.Frame(parent_widget)
-            frame.pack(fill=tk.X, expand=True, pady=(10, 0))
-            label = ttk.Label(frame, text=label_text, width=15)
-            label.pack(side=tk.LEFT, padx=(0, 10))
-            slider = ttk.Scale(frame, from_=from_, to=to, variable=variable)
-            slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            ToolTip(slider, tip)
-            return slider
+        self.threshold_slider = self._create_slider_with_label(audio_tab, "Sound Threshold:", self.sound_threshold_var, 0.1, 2.0, "How loud is 'sound'")
+        self.silence_threshold_slider = self._create_slider_with_label(audio_tab, "Noise Gate (Silence):", self.silence_threshold_var, 0.01, 0.5, "Ignore quiet background noise below this level")
+        self.audio_gain_slider = self._create_slider_with_label(audio_tab, "Audio Gain:", self.audio_gain_var, 0.1, 5.0, "Amplify the input audio signal")
 
-        self.threshold_slider = create_slider_with_label(audio_tab, "Sound Threshold:", self.sound_threshold_var, 0.1, 2.0, "How loud is 'sound'")
-        self.silence_threshold_slider = create_slider_with_label(audio_tab, "Noise Gate (Silence):", self.silence_threshold_var, 0.01, 0.5, "Ignore quiet background noise below this level")
-        self.audio_gain_slider = create_slider_with_label(audio_tab, "Audio Gain:", self.audio_gain_var, 0.1, 5.0, "Amplify the input audio signal")
-
-        # --- NEW: Close button for Advanced Settings ---
+        # --- Close Button ---
         close_settings_frame = ttk.Frame(parent)
         close_settings_frame.pack(fill=tk.X, side=tk.BOTTOM, pady=(10,5), padx=10)
         ttk.Button(close_settings_frame, text="Close Settings", command=self.toggle_settings_window, bootstyle="secondary").pack()
+
 
     def initialize_visualization(self):
         """Initialize the audio visualization based on selected mode."""
@@ -1108,38 +1143,51 @@ class AudioMonitorApp:
         self.save_stats()
         self.log(f"Marked '{self.get_display_name(url)}' as unwatched.", "blue")
 
+    # --- START MODIFICATION: Improved Playlist Mode Handling ---
     def on_playlist_mode_change(self, event=None):
-        """Applies settings based on the selected quick mode."""
+        """Applies settings based on the selected quick mode and enables/disables custom checkboxes."""
         mode = self.playlist_mode_var.get()
         
-        settings = {
-            'expand_playlists': False, 'random_list': False,
-            'true_random_on_skip': False, 'smart_shuffle': False,
-            'shuffle_within_playlists': False, 'sequential_playlists': False
-        }
-        
-        if mode == "Sequential":
-            settings['sequential_playlists'] = True
-        elif mode == "Shuffle All":
-            settings['expand_playlists'] = True
-            settings['random_list'] = True
-        elif mode == "True Random":
-            settings['true_random_on_skip'] = True
-        elif mode == "Smart Shuffle":
-            settings['smart_shuffle'] = True
-        elif mode == "Custom":
-            return 
+        # Enable or disable the custom settings checkboxes based on the mode
+        if self.custom_settings_frame: # Ensure the frame has been created
+            if mode == "Custom":
+                for child in self.custom_settings_frame.winfo_children():
+                    child.config(state=tk.NORMAL)
+            else:
+                for child in self.custom_settings_frame.winfo_children():
+                    child.config(state=tk.DISABLED)
+
+        # Apply settings for preset modes
+        if mode != "Custom":
+            settings = {
+                'expand_playlists': False, 'random_list': False,
+                'true_random_on_skip': False, 'smart_shuffle': False,
+                'shuffle_within_playlists': False, 'sequential_playlists': False
+            }
             
-        self.expand_playlists_var.set(settings['expand_playlists'])
-        self.random_list_var.set(settings['random_list'])
-        self.true_random_on_skip_var.set(settings['true_random_on_skip'])
-        self.smart_shuffle_var.set(settings['smart_shuffle'])
-        self.shuffle_within_playlists_var.set(settings['shuffle_within_playlists'])
-        self.sequential_playlists_var.set(settings['sequential_playlists'])
+            if mode == "Sequential":
+                settings['sequential_playlists'] = True
+            elif mode == "Shuffle All":
+                settings['expand_playlists'] = True
+                settings['random_list'] = True
+            elif mode == "True Random":
+                settings['true_random_on_skip'] = True
+            elif mode == "Smart Shuffle":
+                settings['smart_shuffle'] = True
+                
+            self.expand_playlists_var.set(settings['expand_playlists'])
+            self.random_list_var.set(settings['random_list'])
+            self.true_random_on_skip_var.set(settings['true_random_on_skip'])
+            self.smart_shuffle_var.set(settings['smart_shuffle'])
+            self.shuffle_within_playlists_var.set(settings['shuffle_within_playlists'])
+            self.sequential_playlists_var.set(settings['sequential_playlists'])
 
     def on_custom_setting_change(self, *args):
-        """Switches the mode to 'Custom' if any checkbox is manually changed."""
+        """Switches the mode to 'Custom' and re-enables checkboxes."""
         self.playlist_mode_var.set("Custom")
+        # Explicitly call the handler to re-enable all checkboxes
+        self.on_playlist_mode_change()
+    # --- END MODIFICATION ---
         
     def on_drag_start(self, event):
         """Records the item being dragged."""
@@ -2088,43 +2136,35 @@ class AudioMonitorApp:
             try:
                 self.log("Expanding playlist to get individual videos...", "blue")
                 
-                status_label.config(text="Setting up browser...")
-                progress_dialog.update()
-                
-                if cancelled[0]: return
-                
                 videos = []
                 try:
-                    # ✅ FIX: Reuse or create the main browser instance instead of a temporary one.
-                    # This is more stable and prevents connection errors.
-                    if not self.browser or not self.is_browser_responsive():
-                        self.log("Setting up main browser for playlist expansion...", "cyan")
-                        self.setup_browser()
-
-                    if not self.browser:
-                        raise WebDriverException("Failed to create a browser for scraping.")
-
-                    status_label.config(text="Loading playlist page...")
-                    details_label.config(text=f"URL: {playlist_url[:50]}...")
+                    # MODIFIED: Use a temporary headless browser for playlist expansion.
+                    self.log("Using a temporary headless browser for playlist expansion...", "cyan")
+                    status_label.config(text="Launching temporary browser...")
                     progress_dialog.update()
                     
-                    # Use the persistent self.browser instance for scraping
-                    videos = self.get_playlist_videos(self.browser, playlist_url)
+                    options = uc.ChromeOptions()
+                    options.add_argument("--headless=new")
+                    options.add_argument("--mute-audio")
+
+                    with uc.Chrome(options=options, patcher_force_close=True) as temp_browser:
+                        if cancelled[0]: return
+                        status_label.config(text="Loading playlist page...")
+                        details_label.config(text=f"URL: {playlist_url[:50]}...")
+                        progress_dialog.update()
+                        videos = self.get_playlist_videos(temp_browser, playlist_url)
                     
                     status_label.config(text=f"Found {len(videos)} videos!")
                     details_label.config(text="Preparing playback...")
                     progress_dialog.update()
                     
                 except Exception as e:
-                    self.log(f"Error expanding playlist: {e}", "red")
+                    self.log(f"Error expanding playlist with headless browser: {e}", "red")
                     status_label.config(text="Error expanding playlist!")
                     details_label.config(text=str(e)[:50])
                     progress_dialog.update()
                     time.sleep(2)
                     return
-                finally:
-                    # We no longer quit the browser here as it's the main persistent one.
-                    pass
                 
                 if cancelled[0]: return
                 
@@ -2154,12 +2194,8 @@ class AudioMonitorApp:
                     self.set_button_states('monitoring')
                     self.update_playlist_info()
                     
-                    # The browser should already be set up from the scraping step
-                    if not self.is_browser_responsive():
-                        self.log("Browser became unresponsive after scraping.", "red")
-                        self.stop_monitoring()
-                        return
-                    
+                    # self.browser is NOT expected to be ready here.
+                    # load_video() will create it on demand with the correct (non-headless) settings.
                     self.log(f"Loading first video: {self.get_display_name(self.current_url, format_type='log')}", "green")
                     self.load_video(self.current_url)
                     
@@ -2641,28 +2677,27 @@ class AudioMonitorApp:
 
     def monitor_loop(self, urls_to_monitor):
         try:
-            # --- START: Simplified Playlist Handling ---
+            # --- START: MODIFIED Playlist Handling ---
             self.log("Monitor loop started. Preparing playlist...", "cyan")
             
-            # The 'expand_playlists_var' now controls if ALL playlists are expanded into one big list.
-            # Otherwise, 'always_expand_playlists' will just expand the very first item if it's a playlist.
-            if self.expand_playlists_var.get():
-                self.log("Expanding all playlists as per settings...", "blue")
-                # This requires a browser, so we set it up if needed
-                if any(self.get_url_type(url) == "Playlist" for url in urls_to_monitor):
-                    if not self.browser or not self.is_browser_responsive():
-                        self.setup_browser()
-                    if self.browser:
-                        urls_to_monitor = self.preprocess_playlists(urls_to_monitor, self.browser)
-                    else:
-                        self.log("Could not set up browser to expand playlists. Stopping.", "red")
-                        self.root.after(0, self.stop_monitoring)
-                        self.setup_complete_event.set()
-                        return
+            # If "Expand All Playlists" is checked, use a temporary headless browser to scrape everything first.
+            if self.expand_playlists_var.get() and any(self.get_url_type(url) == "Playlist" for url in urls_to_monitor):
+                self.log("Expanding all playlists in a temporary headless browser...", "blue")
+                try:
+                    options = uc.ChromeOptions()
+                    options.add_argument("--headless=new")
+                    options.add_argument("--mute-audio")
+                    with uc.Chrome(options=options, patcher_force_close=True) as temp_browser:
+                        urls_to_monitor = self.preprocess_playlists(urls_to_monitor, temp_browser)
+                except Exception as e:
+                    self.log(f"Failed to expand playlists in headless mode: {e}", "red")
+                    self.root.after(0, self.stop_monitoring)
+                    self.setup_complete_event.set()
+                    return
             else:
-                 # This is the default behavior: only expand the first item if it's a playlist.
+                 # Default behavior: only expand the first item if it's a playlist (now also done headlessly).
                  urls_to_monitor = self.always_expand_playlists(urls_to_monitor)
-            # --- END: Simplified Playlist Handling ---
+            # --- END: MODIFIED Playlist Handling ---
 
             if self.true_random_on_skip_var.get():
                 self.true_random_monitor_loop(urls_to_monitor)
@@ -2684,6 +2719,7 @@ class AudioMonitorApp:
 
             has_web_urls = any(not self.is_local_file(url) for url in self.main_queue)
             if has_web_urls and not self.browser:
+                # This will now create the VISIBLE browser for playback.
                 self.setup_browser()
                 if not self.browser:
                     self.log("Browser setup failed. Stopping playback.", "red")
