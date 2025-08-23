@@ -626,53 +626,52 @@ class AudioMonitorApp:
 
         ttk.Button(playlist_button_frame, text="📊 View Statistics", command=self.view_stats, bootstyle="info-outline").pack(side=tk.RIGHT, padx=5)
 
-        # Improved Navigation Panel - Replace lines 884-907 in your code
+        # --- START: NEW ENHANCED NAVIGATION PANEL ---
+        self.nav_frame = ttk.Labelframe(playlist_tab, text="Navigation", padding=10)
+        
+        # Main container for the single-line layout
+        enhanced_main = ttk.Frame(self.nav_frame)
+        enhanced_main.pack(fill=tk.X, pady=5)
 
-       # Navigation Controls (inside playlist tab) 
-        self.nav_frame = ttk.Labelframe(playlist_tab, text="Navigation", padding="5")
+        # Left-side buttons
+        ttk.Button(enhanced_main, text="◀◀ -10", command=lambda: self.skip_videos(-10)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(enhanced_main, text="◀ -5", command=lambda: self.skip_videos(-5)).pack(side=tk.LEFT, padx=2)
+        self.prev_btn = ttk.Button(enhanced_main, text="◀ Prev", command=self.previous_video, state=tk.DISABLED, bootstyle="primary")
+        self.prev_btn.pack(side=tk.LEFT, padx=(2, 8))
 
-        # Single line ultra-compact navigation
-        nav_line = ttk.Frame(self.nav_frame)
-        nav_line.pack(fill=tk.X)
+        # Right-side buttons (packed in reverse order of appearance for correct layout)
+        ttk.Button(enhanced_main, text="+10 ▶▶", command=lambda: self.skip_videos(10)).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(enhanced_main, text="+5 ▶", command=lambda: self.skip_videos(5)).pack(side=tk.RIGHT, padx=2)
+        self.next_btn = ttk.Button(enhanced_main, text="Next ▶", command=self.next_video, state=tk.DISABLED, bootstyle="primary")
+        self.next_btn.pack(side=tk.RIGHT, padx=(8, 2))
+        
+        # Center jump control - a container that expands to fill the middle space
+        enhanced_jump_frame = ttk.Frame(enhanced_main)
+        enhanced_jump_frame.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
 
-        # Left side - Previous controls
-        ttk.Button(nav_line, text="◀◀", command=lambda: self.skip_videos(-10), 
-                width=3, bootstyle="secondary-outline").pack(side=tk.LEFT, padx=1)
-        ttk.Button(nav_line, text="-5", command=lambda: self.skip_videos(-5), 
-                width=3, bootstyle="secondary-outline").pack(side=tk.LEFT, padx=1)
-        self.prev_btn = ttk.Button(nav_line, text="◀", command=self.previous_video, 
-                                state=tk.DISABLED, bootstyle="primary", width=3)
-        self.prev_btn.pack(side=tk.LEFT, padx=3)
+        # The visible, styled group of widgets that will be centered within the container
+        jump_container = ttk.Frame(enhanced_jump_frame, bootstyle="secondary", padding=5)
+        jump_container.pack() # Using .pack() with no arguments centers the widget
 
-        # Center - Jump control (compact)
-        center_frame = ttk.Frame(nav_line)
-        center_frame.pack(side=tk.LEFT, expand=True)
-        jump_container = ttk.Frame(center_frame)
-        jump_container.pack(expand=True)
-
-        self.jump_entry = ttk.Entry(jump_container, textvariable=self.jump_entry_var, 
-                                    width=4, justify='center', font=(get_japanese_font(), 10))
+        ttk.Label(jump_container, text="Jump to:").pack(side=tk.LEFT, padx=(0, 5))
+        self.jump_entry = ttk.Entry(jump_container, textvariable=self.jump_entry_var, width=5, justify='center')
         self.jump_entry.pack(side=tk.LEFT)
         self.jump_entry.bind('<Return>', self.on_jump_entry)
         self.jump_entry.bind('<KP_Enter>', self.on_jump_entry)
+        self.total_videos_label = ttk.Label(jump_container, text="/ --")
+        self.total_videos_label.pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Button(jump_container, text="Go", command=self.on_jump_entry, bootstyle="primary", width=4).pack(side=tk.LEFT)
+        
 
-        ttk.Label(jump_container, text="/", font=(get_japanese_font(), 10)).pack(side=tk.LEFT, padx=2)
-        self.total_videos_label = ttk.Label(jump_container, text="--", font=(get_japanese_font(), 10, 'bold'))
-        self.total_videos_label.pack(side=tk.LEFT)
+        # Visual progress indicator (New position, above info label)
+        self.nav_progress_var = tk.DoubleVar(value=0)
+        self.nav_progress = ttk.Progressbar(self.nav_frame, variable=self.nav_progress_var, maximum=100)
+        self.nav_progress.pack(fill=tk.X, pady=(8, 5))
 
-        # Right side - Next controls
-        self.next_btn = ttk.Button(nav_line, text="▶", command=self.next_video, 
-                                state=tk.DISABLED, bootstyle="primary", width=3)
-        self.next_btn.pack(side=tk.RIGHT, padx=3)
-        ttk.Button(nav_line, text="+5", command=lambda: self.skip_videos(5), 
-                width=3, bootstyle="secondary-outline").pack(side=tk.RIGHT, padx=1)
-        ttk.Button(nav_line, text="▶▶", command=lambda: self.skip_videos(10), 
-                width=3, bootstyle="secondary-outline").pack(side=tk.RIGHT, padx=1)
-
-        # Info label below (smaller, more compact)
-        self.playlist_info_label = ttk.Label(self.nav_frame, text="No playlist loaded", 
-                                            font=(get_japanese_font(), 9), bootstyle="secondary")
-        self.playlist_info_label.pack(fill=tk.X, pady=(3, 0))
+        # Info label below the progress bar
+        self.playlist_info_label = ttk.Label(self.nav_frame, text="No playlist loaded", font=(get_japanese_font(), 9), bootstyle="secondary")
+        self.playlist_info_label.pack(fill=tk.X, pady=(0, 5))
+        # --- END: NEW ENHANCED NAVIGATION PANEL ---
 
 
         # -- Tab 2: Settings --
@@ -3600,50 +3599,64 @@ class AudioMonitorApp:
         return f"{type_emoji} {title}"
 
     def update_playlist_info(self):
+        """Updates the new enhanced navigation panel with detailed info and progress."""
         if not self.is_monitoring:
             self.nav_frame.pack_forget()
             return
 
+        # Ensure the navigation frame is visible when monitoring
         self.nav_frame.pack(fill=tk.X, pady=5)
+
+        current_index = 0
+        total_count = 0
+        queue_type = ""
+        current_title = self.get_display_name(self.current_url)
+        if len(current_title) > 40:
+            current_title = current_title[:37] + "..."
 
         # Case 1: We are inside a sequential playlist
         if self.current_playlist_videos and len(self.current_playlist_videos) > 1:
-            current_title = self.get_display_name(self.current_url)
-            if len(current_title) > 40:
-                current_title = current_title[:37] + "..."
-            info = f"Playlist: {self.current_playlist_index + 1} / {len(self.current_playlist_videos)} - {current_title}"
-            self.playlist_info_label.config(text=info)
-
-            self.prev_btn.config(state=tk.NORMAL if self.current_playlist_index > 0 else tk.DISABLED)
-            self.next_btn.config(state=tk.NORMAL if self.current_playlist_index < len(self.current_playlist_videos) - 1 else tk.DISABLED)
-
-            self.jump_entry_var.set(str(self.current_playlist_index + 1))
-            self.total_videos_label.config(text=str(len(self.current_playlist_videos)))
-            self.current_video_title_var.set(current_title)
+            current_index = self.current_playlist_index
+            total_count = len(self.current_playlist_videos)
+            queue_type = "Playlist"
+            self.prev_btn.config(state=tk.NORMAL if current_index > 0 else tk.DISABLED)
+            self.next_btn.config(state=tk.NORMAL if current_index < total_count - 1 else tk.DISABLED)
 
         # Case 2: We are in the main queue
         elif hasattr(self, 'main_queue') and self.main_queue:
-            current_title = self.get_display_name(self.current_url)
-            if len(current_title) > 40:
-                current_title = current_title[:37] + "..."
-            info = f"Queue: {self.main_queue_index + 1} / {len(self.main_queue)} - {current_title}"
-            self.playlist_info_label.config(text=info)
+            current_index = self.main_queue_index
+            total_count = len(self.main_queue)
+            queue_type = "Queue"
+            self.prev_btn.config(state=tk.NORMAL if current_index > 0 else tk.DISABLED)
+            self.next_btn.config(state=tk.NORMAL if current_index < total_count - 1 else tk.DISABLED)
 
-            self.prev_btn.config(state=tk.NORMAL if self.main_queue_index > 0 else tk.DISABLED)
-            self.next_btn.config(state=tk.NORMAL if self.main_queue_index < len(self.main_queue) - 1 else tk.DISABLED)
-            
-            self.jump_entry_var.set(str(self.main_queue_index + 1)) # <-- This line was missing
-            self.total_videos_label.config(text=str(len(self.main_queue)))
-            self.current_video_title_var.set("")
-
-        # Case 3: A single video is playing directly (not in a queue)
+        # Case 3: A single video is playing directly
         else:
-            self.playlist_info_label.config(text=f"Now Playing: {self.get_display_name(self.current_url)}")
+            current_index = 0
+            total_count = 1
+            queue_type = "Now Playing"
             self.prev_btn.config(state=tk.DISABLED)
             self.next_btn.config(state=tk.DISABLED)
-            self.jump_entry_var.set("1")
-            self.total_videos_label.config(text="1")
-            self.current_video_title_var.set("")
+
+        # Update all UI elements with the determined state
+        if total_count > 0:
+            # Info label text (like in mockup C)
+            info_text = f"Playing: \"{current_title}\" • Position {current_index + 1} of {total_count} ({queue_type})"
+            self.playlist_info_label.config(text=info_text)
+
+            # Jump control numbers
+            self.jump_entry_var.set(str(current_index + 1))
+            self.total_videos_label.config(text=f"/ {total_count}")
+
+            # Visual Progress Bar
+            progress = ((current_index + 1) / total_count) * 100
+            self.nav_progress_var.set(progress)
+        else:
+            # Fallback for an empty or invalid state
+            self.playlist_info_label.config(text="No playlist loaded")
+            self.jump_entry_var.set("0")
+            self.total_videos_label.config(text="/ 0")
+            self.nav_progress_var.set(0)
 
         self.update_tray_menu()
     
