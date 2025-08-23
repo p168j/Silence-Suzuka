@@ -38,7 +38,7 @@ in the app's dropdown menu.
 ============================================================================
 """
 
-print("Starting Silence Suzuka Application with a Modern UI...")
+print("Starting Silence Suzuka...")
 
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, filedialog, simpledialog
