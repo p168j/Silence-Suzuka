@@ -635,54 +635,111 @@ class AudioMonitorApp:
 
         ttk.Button(playlist_button_frame, text="📊 View Statistics", command=self.view_stats, bootstyle="info-outline").pack(side=tk.RIGHT, padx=5)
 
-        # --- START: FINAL CORRECTED NAVIGATION PANEL ---
-        self.nav_frame = ttk.Labelframe(playlist_tab, text="Navigation", padding=10)
+        # --- START: BALANCED COMPACT NAVIGATION PANEL ---
+        self.nav_frame = ttk.Labelframe(playlist_tab, text="Navigation", padding=5)
         
         # Main container for the single-line layout
         enhanced_main = ttk.Frame(self.nav_frame)
-        enhanced_main.pack(fill=tk.X, pady=5)
+        enhanced_main.pack(fill=tk.X)
 
-        # Left-side buttons with direct padding to increase their size
-        ttk.Button(enhanced_main, text="◀◀ -10", command=lambda: self.skip_videos(-10), padding=(10, 8)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(enhanced_main, text="◀ -5", command=lambda: self.skip_videos(-5), padding=(10, 8)).pack(side=tk.LEFT, padx=2)
-        self.prev_btn = ttk.Button(enhanced_main, text="◀ Prev", command=self.previous_video, state=tk.DISABLED, bootstyle="primary", padding=(10, 8))
-        self.prev_btn.pack(side=tk.LEFT, padx=(2, 8))
+        # Create a centered frame that will hold all controls
+        controls_container = ttk.Frame(enhanced_main)
+        controls_container.pack(expand=True)
 
-        # Right-side buttons with direct padding
-        ttk.Button(enhanced_main, text="+10 ▶▶", command=lambda: self.skip_videos(10), padding=(10, 8)).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(enhanced_main, text="+5 ▶", command=lambda: self.skip_videos(5), padding=(10, 8)).pack(side=tk.RIGHT, padx=2)
-        self.next_btn = ttk.Button(enhanced_main, text="Next ▶", command=self.next_video, state=tk.DISABLED, bootstyle="primary", padding=(10, 8))
-        self.next_btn.pack(side=tk.RIGHT, padx=(8, 2))
+        # Left-side buttons
+        ttk.Button(
+            controls_container, 
+            text="◀◀ -10", 
+            command=lambda: self.skip_videos(-10),
+            bootstyle="dark-outline"
+        ).pack(side=tk.LEFT, padx=2)
         
-        # Center jump control container
-        enhanced_jump_frame = ttk.Frame(enhanced_main)
-        enhanced_jump_frame.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
-        enhanced_jump_frame.grid_columnconfigure(0, weight=1)
-        enhanced_jump_frame.grid_columnconfigure(2, weight=1)
+        ttk.Button(
+            controls_container, 
+            text="◀ -5", 
+            command=lambda: self.skip_videos(-5),
+            bootstyle="dark-outline"
+        ).pack(side=tk.LEFT, padx=2)
+        
+        self.prev_btn = ttk.Button(
+            controls_container, 
+            text="◀ Prev", 
+            command=self.previous_video, 
+            state=tk.DISABLED, 
+            bootstyle="primary"
+        )
+        self.prev_btn.pack(side=tk.LEFT, padx=(2, 15))
 
-        # The visible, styled group of widgets using bootstyle for background
-        jump_container = ttk.Frame(enhanced_jump_frame, bootstyle="secondary", padding=5)
-        jump_container.grid(row=0, column=1) # This centers the box
+        # Center jump control - no expand, just normal packing
+        jump_container = ttk.Frame(controls_container)
+        jump_container.pack(side=tk.LEFT, padx=10)
 
-        # Widgets inside the jump box with inverse colors to be visible
-        ttk.Label(jump_container, text="Jump to:", bootstyle="inverse-secondary").pack(side=tk.LEFT, padx=(0, 5))
-        self.jump_entry = ttk.Entry(jump_container, textvariable=self.jump_entry_var, width=5, justify='center')
+        ttk.Label(jump_container, text="Jump to:").pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.jump_entry = ttk.Entry(
+            jump_container, 
+            textvariable=self.jump_entry_var, 
+            width=5, 
+            justify='center',
+            bootstyle="primary"
+        )
         self.jump_entry.pack(side=tk.LEFT)
         self.jump_entry.bind('<Return>', self.on_jump_entry)
         self.jump_entry.bind('<KP_Enter>', self.on_jump_entry)
-        self.total_videos_label = ttk.Label(jump_container, text="/ --", bootstyle="inverse-secondary")
-        self.total_videos_label.pack(side=tk.LEFT, padx=(2, 8))
-        ttk.Button(jump_container, text="Go", command=self.on_jump_entry, bootstyle="primary", width=4).pack(side=tk.LEFT)
+        
+        self.total_videos_label = ttk.Label(jump_container, text="/ --")
+        self.total_videos_label.pack(side=tk.LEFT, padx=3)
+        
+        ttk.Button(
+            jump_container, 
+            text="Go", 
+            command=self.on_jump_entry, 
+            bootstyle="primary"
+        ).pack(side=tk.LEFT, padx=(3, 0))
 
-        # Visual progress indicator
+        # Right-side buttons
+        self.next_btn = ttk.Button(
+            controls_container, 
+            text="Next ▶", 
+            command=self.next_video, 
+            state=tk.DISABLED, 
+            bootstyle="primary"
+        )
+        self.next_btn.pack(side=tk.LEFT, padx=(15, 2))
+        
+        ttk.Button(
+            controls_container, 
+            text="+5 ▶", 
+            command=lambda: self.skip_videos(5),
+            bootstyle="dark-outline"
+        ).pack(side=tk.LEFT, padx=2)
+        
+        ttk.Button(
+            controls_container, 
+            text="+10 ▶▶", 
+            command=lambda: self.skip_videos(10),
+            bootstyle="dark-outline"
+        ).pack(side=tk.LEFT, padx=2)
+
+        # Simple progress bar
         self.nav_progress_var = tk.DoubleVar(value=0)
-        self.nav_progress = ttk.Progressbar(self.nav_frame, variable=self.nav_progress_var, maximum=100)
-        self.nav_progress.pack(fill=tk.X, pady=(8, 5))
+        self.nav_progress = ttk.Progressbar(
+            self.nav_frame, 
+            variable=self.nav_progress_var, 
+            maximum=100,
+            bootstyle="info-striped"
+        )
+        self.nav_progress.pack(fill=tk.X, pady=(5, 3))
 
-        # Info label
-        self.playlist_info_label = ttk.Label(self.nav_frame, text="No playlist loaded", font=(get_japanese_font(), 9), bootstyle="secondary")
-        self.playlist_info_label.pack(fill=tk.X, pady=(0, 5))
-        # --- END: FINAL CORRECTED NAVIGATION PANEL ---
+        # Simple info label
+        self.playlist_info_label = ttk.Label(
+            self.nav_frame, 
+            text="Playback stopped. Press Play to begin.", 
+            font=(get_japanese_font(), 9)
+        )
+        self.playlist_info_label.pack(fill=tk.X, pady=(3, 0))
+        
+        # --- END: BALANCED COMPACT NAVIGATION PANEL ---
 
         # -- Tab 2: Settings --
         settings_tab = ttk.Frame(notebook, padding=10)
