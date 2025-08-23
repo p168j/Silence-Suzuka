@@ -1367,6 +1367,7 @@ class AudioMonitorApp:
         try:
             def create_calendar_heatmap():
                 """Processes data and creates the heatmap plot."""
+                # 1. Load and prepare the raw data
                 data = {
                     date.fromisoformat(day): data.get('total_monitored_time', 0) / 3600.0
                     for day, data in self.stats.items()
@@ -1374,24 +1375,34 @@ class AudioMonitorApp:
                 }
                 if not data:
                     return None
-
                 all_days = pd.Series(data)
                 all_days.index = pd.to_datetime(all_days.index)
 
+                # 2. Create the correctly aligned date range
                 end_date = date.today()
                 start_date = end_date - timedelta(days=365)
-
-                date_range = pd.date_range(start=start_date, end=end_date)
+                start_date_aligned = start_date - timedelta(days=start_date.weekday())
+                end_date_aligned = end_date + timedelta(days=(6 - end_date.weekday()))
+                date_range = pd.date_range(start=start_date_aligned, end=end_date_aligned)
                 all_days = all_days.reindex(date_range, fill_value=0)
 
+                # 3. Build and clean the DataFrame
                 all_days_df = pd.DataFrame({'date': all_days.index, 'hours': all_days.values})
+                all_days_df['hours'] = pd.to_numeric(all_days_df['hours'], errors='coerce').fillna(0)
                 all_days_df['weekday'] = all_days_df['date'].dt.weekday
-                all_days_df['week_of_year'] = all_days_df['date'].dt.isocalendar().week
-                all_days_df['year'] = all_days_df['date'].dt.year
-                all_days_df['unique_week'] = all_days_df['year'].astype(str) + '-' + all_days_df['week_of_year'].astype(str).str.zfill(2)
+                all_days_df['unique_week'] = all_days_df['date'].dt.strftime('%Y-%W')
 
-                heatmap_data = all_days_df.pivot(index='weekday', columns='unique_week', values='hours')
+                # 4. <<< THE DEFINITIVE FIX FOR THE BLACK LINE >>>
+                # Use the more robust `pivot_table` instead of `pivot`.
+                # The `fill_value=0` argument handles missing data correctly.
+                heatmap_data = all_days_df.pivot_table(
+                    index='weekday',
+                    columns='unique_week',
+                    values='hours',
+                    fill_value=0
+                )
 
+                # --- Plotting Code ---
                 bg_color = self.root.style.colors.bg
                 fg_color = self.root.style.colors.fg
 
@@ -1399,6 +1410,7 @@ class AudioMonitorApp:
                 fig.patch.set_facecolor(bg_color)
                 ax.set_facecolor(bg_color)
 
+                # 5. <<< RESTORE THE GRID LINES >>>
                 sns.heatmap(heatmap_data, ax=ax, cmap="Greens", cbar=True, linewidths=.5, linecolor=bg_color,
                             cbar_kws={'label': 'Hours Played', 'orientation': 'vertical'})
 
@@ -1407,24 +1419,23 @@ class AudioMonitorApp:
                 ax.set_xlabel('')
                 ax.set_yticklabels(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'], rotation=0, color=fg_color)
 
+                # 6. Create the month labels
                 month_ticks = []
                 month_labels = []
                 last_month = -1
-
                 for i, week_str in enumerate(heatmap_data.columns):
                     try:
-                        first_day_of_week = all_days_df[all_days_df['unique_week'] == week_str]['date'].min()
+                        first_day_of_week = pd.to_datetime(week_str + '-1', format='%Y-%W-%w')
                         current_month = first_day_of_week.month
-
                         if current_month != last_month:
                             month_ticks.append(i + 0.5)
-                            month_labels.append(first_day_of_week.strftime('%b'))
+                            month_labels.append(first_day_of_week.strftime("%b '%y"))
                             last_month = current_month
                     except (ValueError, IndexError):
                         continue
-
+                
                 ax.set_xticks(month_ticks)
-                ax.set_xticklabels(month_labels, rotation=0, ha='center', color=fg_color)
+                ax.set_xticklabels(month_labels, rotation=30, ha='right', color=fg_color, fontsize=9)
                 ax.tick_params(axis='x', length=0)
                 ax.tick_params(axis='y', length=0)
 
