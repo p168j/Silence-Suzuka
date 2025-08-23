@@ -2620,7 +2620,6 @@ class AudioMonitorApp:
 
     def on_closing(self):
         # ✅ FEATURE: Persistent Browser Window - Save geometry on close
-        self.update_player_geometries()
         if self.is_monitoring: self.save_current_timestamp(); self.save_stats()
         self.save_profile() # Save settings on close
         if self.browser:
@@ -3121,12 +3120,25 @@ class AudioMonitorApp:
             current_profile_data[var_name] = getattr(self, f"{var_name}_var").get()
         
         current_profile_data['app_geometry'] = self.root.geometry()
-        try:
-            current_profile_data['browser_geometry'] = json.loads(self.browser_geometry_var.get())
-        except (json.JSONDecodeError, TypeError):
-            current_profile_data['browser_geometry'] = {}
         
-        # Fixed: Add stats window geometry saving
+        # --- START BUG FIX ---
+        # This is the key change: Directly get the browser geometry when saving.
+        if self.browser and self.is_browser_responsive():
+            try:
+                pos = self.browser.get_window_position()
+                size = self.browser.get_window_size()
+                browser_geom = {'x': pos['x'], 'y': pos['y'], 'width': size['width'], 'height': size['height']}
+                current_profile_data['browser_geometry'] = browser_geom
+                self.log("Saved browser geometry.", "green")
+            except WebDriverException:
+                self.log("Could not get browser geometry to save, it may have been closed.", "orange")
+        else:
+             try:
+                current_profile_data['browser_geometry'] = json.loads(self.browser_geometry_var.get())
+             except (json.JSONDecodeError, TypeError):
+                current_profile_data['browser_geometry'] = {}
+        # --- END BUG FIX ---
+        
         current_profile_data['stats_window_geometry'] = getattr(self, 'stats_window_geometry', '')
 
         if "profiles" not in self.config_data:
